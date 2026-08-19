@@ -23,18 +23,40 @@ $env:SEARCH_API_KEY = "your-api-key"
 
 ## 実行とテスト
 
+### 1. GUI (デスクトップアプリ) での実行
 ```powershell
+python gui/run.py
+```
+> PySide6 による GUI ウィンドウが起動します。クエリ入力、設定変更（モデル名、URL、並列数等）、調査レポートの閲覧・コピー・ファイル保存、参照ソース一覧のテーブル表示（クリックでブラウザ表示）、リアルタイム実行ログの確認が可能です。
+
+### 2. CLI (コマンドライン) での実行
+```powershell
+# デフォルトのクエリで実行
 python main.py
-pytest -q
+
+# 任意のクエリを指定して実行
+python main.py "最新の生成AIトレンドについて調査してください"
+
+# オプション指定（モデル名やエンドポイントの指定）
+python main.py --model "my-model" --base-url "http://localhost:1234/v1" "調査テーマ"
+```
+
+### 3. テストの実行
+```powershell
+pytest -v
 ```
 
 Windows では出力を UTF-8 に固定しているため、ローカルモデルが日本語以外の Unicode 文字を含む回答を返しても表示できます。
 
 ## 構成
 
-- `search_orchestrator.py`: ワークフロー、状態、検索結果の整形、再ランキング
-- `main.py`: 実行入口
+- `search_orchestrator.py`: 内部コアロジック（LangGraph ワークフロー、状態、検索結果の整形、再ランキング）
+- `gui/`: PySide6 を用いたデスクトップ GUI パッケージ
+  - `main_window.py`: メインウィンドウ UI、各種操作イベント、スタイル定義
+  - `worker.py`: QThread による非同期・非ブロッキング実行ワーカー
+  - `run.py`: GUI アプリケーションの起動エントリポイント
+- `main.py`: CLI 実行入口
 - `main1.1.py`: 既存の実行コマンド向け互換入口
-- `tests/`: 外部サービス不要のユニットテスト
+- `tests/`: 外部サービス不要のユニットテスト（コアロジックおよび GUI 初期化テスト）
 
 検索結果は LangGraph の累積状態です。追加検索ノードは新規取得分だけを返すため、既存の結果を重複して累積しません。再ランキングは CPU 負荷が高いため、既定では最大6クエリ・各5件を取得し、並列実行数を2に制限しています。

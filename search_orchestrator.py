@@ -124,13 +124,21 @@ def rerank_results(results: list[SearchResult], reranker: Reranker, top_k: int) 
     return sorted(scored, key=lambda item: item.relevance_score or 0.0, reverse=True)[:top_k]
 
 
-def create_workflow(settings: Settings):
-    """Build the graph and initialize its runtime-only dependencies."""
-    llm = ChatOpenAI(model=settings.model, base_url=settings.base_url, api_key=settings.api_key)
+def create_workflow(
+    settings: Settings,
+    search: SearchClient | None = None,
+    reranker: Reranker | None = None,
+    llm: ChatOpenAI | None = None,
+):
+    """Build the graph and initialize its dependencies."""
+    if llm is None:
+        llm = ChatOpenAI(model=settings.model, base_url=settings.base_url, api_key=settings.api_key)
     planner_llm = llm.with_structured_output(SearchPlan)
     evaluation_llm = llm.with_structured_output(Evaluation)
-    search: SearchClient = DDGS()
-    reranker: Reranker = CrossEncoder(settings.reranker_model)
+    if search is None:
+        search = DDGS()
+    if reranker is None:
+        reranker = CrossEncoder(settings.reranker_model)
 
     def planner(state: State):
         response = planner_llm.invoke(f"""あなたはリサーチプランナーです。現在日: {date.today().isoformat()}
@@ -160,10 +168,11 @@ def create_workflow(settings: Settings):
         }
 
     def evaluate(state: State):
+        unique_results = deduplicate_results(state.get("results", []))
         response = evaluation_llm.invoke(f"""あなたはリサーチ品質評価担当です。現在日: {date.today().isoformat()}
 質問: {state['query']}
 調査計画: {state['plan']}
-検索結果: {state['results']}
+検索結果: {unique_results}
 計画の主要観点、根拠の強さ、情報源の信頼性と新しさを厳密に評価してください。
 不足時は missing_information と weak_evidence を具体化し、追加検索クエリを最大3件指定してください。
 追加検索、不足情報、または弱い根拠があれば sufficient は false にしてください。""")
@@ -188,25 +197,37 @@ def create_workflow(settings: Settings):
             return {"results": [], "search_query_count": 0, "search_round": 1}
         remaining = settings.max_search_queries - state["search_query_count"]
         queries = evaluation.additional_queries[:max(remaining, 0)]
-        # State.results is reducer-backed, so return only this round's delta.
-        known_results = list(state["results"])
+        existing_urls = {item.url for item in state.get("results", []) if item.url}
+        delta_results: list[SearchResult] = []
         for query in queries:
+            query_fresh: list[SearchResult] = []
             try:
                 response = search.text(query, max_results=settings.results_per_query)
-                add_search_results(known_results, response, query)
+                for item in response:
+                    url = item.get("href", "")
+                    if not url or url in existing_urls:
+                        continue
+                    query_fresh.append(SearchResult(
+                        query=query, title=item.get("title", ""), url=url,
+                        snippet=item.get("body", ""),
+                    ))
+                    existing_urls.add(url)
+                delta_results.extend(
+                    rerank_results(query_fresh, reranker, settings.reranked_results_per_query)
+                )
             except Exception as error:
                 print(f"追加検索失敗 ({query}): {error}")
-        delta = known_results[len(state["results"]):]
         return {
-            "results": rerank_results(delta, reranker, settings.reranked_results_per_query),
+            "results": delta_results,
             "search_query_count": len(queries),
             "search_round": 1,
         }
 
     def analyze(state: State):
+        unique_results = deduplicate_results(state.get("results", []))
         response = llm.invoke(f"""以下の検索結果だけを根拠に質問へ回答してください。
 質問: {state['query']}
-検索結果: {state['results']}
+検索結果: {unique_results}
 重要な主張には、根拠となる検索結果に含まれる URL を示してください。確認できないことは断定せず、URLを捏造しないでください。""")
         return {"summary": response.content}
 
