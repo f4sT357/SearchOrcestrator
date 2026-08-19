@@ -1,0 +1,5 @@
+ddgs
+langchain-openai
+langgraph
+pydantic>=2
+sentence-transformers
