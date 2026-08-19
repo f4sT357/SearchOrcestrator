@@ -1,0 +1,10 @@
+{
+  "model": "lfm2.5-8b-a1b-heretic-imatrix",
+  "base_url": "http://localhost:1234/v1",
+  "api_key": "lm-studio",
+  "max_concurrency": 2,
+  "max_search_queries": 15,
+  "max_search_rounds": 5,
+  "fetch_web_content": true,
+  "max_content_length": 3000
+}

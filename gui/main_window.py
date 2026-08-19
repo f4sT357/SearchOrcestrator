@@ -1,4 +1,4 @@
-﻿"""PySide6 Main Window for Search Orchestrator."""
+"""PySide6 Main Window for Search Orchestrator."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -41,8 +42,9 @@ parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
+import json
 from gui.worker import ResearchWorker
-from search_orchestrator import SearchResult, Settings
+from search_orchestrator import SearchResult, Settings, fetch_available_models
 
 
 class MainWindow(QMainWindow):
@@ -53,13 +55,18 @@ class MainWindow(QMainWindow):
         self.worker: ResearchWorker | None = None
         self.last_results: list[SearchResult] = []
         self.default_settings = Settings.from_environment()
+        self.config_path = os.path.join(parent_dir, "config.json")
 
         self.setWindowTitle("Search Orchestrator - AI Web Research Assistant")
         self.resize(1050, 780)
         self.setMinimumSize(800, 600)
 
         self._setup_ui()
+        self._load_config()
         self._apply_stylesheet()
+
+        # Fetch models once on application startup as requested
+        self._refresh_model_list(show_feedback=False)
 
     def _setup_ui(self) -> None:
         central_widget = QWidget(self)
@@ -116,8 +123,21 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout(self.settings_group)
         settings_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self.model_edit = QLineEdit(self.default_settings.model, self)
-        settings_layout.addRow("LLMモデル名:", self.model_edit)
+        # Model selection with Combobox and Refresh button
+        model_row = QHBoxLayout()
+        self.model_combo = QComboBox(self)
+        self.model_combo.setEditable(True)
+        self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.model_combo.addItem(self.default_settings.model)
+        self.model_combo.setCurrentText(self.default_settings.model)
+        model_row.addWidget(self.model_combo, stretch=1)
+
+        self.refresh_models_btn = QPushButton("🔄 AIモデル一覧を更新", self)
+        self.refresh_models_btn.setObjectName("secondaryBtn")
+        self.refresh_models_btn.clicked.connect(self._on_refresh_models_clicked)
+        model_row.addWidget(self.refresh_models_btn)
+
+        settings_layout.addRow("LLMモデル名:", model_row)
 
         self.base_url_edit = QLineEdit(self.default_settings.base_url, self)
         settings_layout.addRow("Base URL (APIエンドポイント):", self.base_url_edit)
@@ -147,6 +167,22 @@ class MainWindow(QMainWindow):
         num_row.addStretch()
 
         settings_layout.addRow("実行制御:", num_row)
+
+        # Web Fetch Options
+        web_row = QHBoxLayout()
+        self.fetch_content_cb = QCheckBox("Webページ本文を実際に取得して精読する", self)
+        self.fetch_content_cb.setChecked(self.default_settings.fetch_web_content)
+        web_row.addWidget(self.fetch_content_cb)
+
+        self.max_content_length_spin = QSpinBox(self)
+        self.max_content_length_spin.setRange(500, 10000)
+        self.max_content_length_spin.setSingleStep(500)
+        self.max_content_length_spin.setValue(self.default_settings.max_content_length)
+        web_row.addWidget(QLabel("本文最大文字数:"))
+        web_row.addWidget(self.max_content_length_spin)
+        web_row.addStretch()
+
+        settings_layout.addRow("Webアクセス:", web_row)
         main_layout.addWidget(self.settings_group)
 
         # Progress / Status Bar
@@ -194,13 +230,14 @@ class MainWindow(QMainWindow):
         sources_layout = QVBoxLayout(sources_tab)
         sources_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.sources_table = QTableWidget(0, 5, self)
-        self.sources_table.setHorizontalHeaderLabels(["#", "クエリ", "タイトル", "スコア", "URL (クリックで開く)"])
+        self.sources_table = QTableWidget(0, 6, self)
+        self.sources_table.setHorizontalHeaderLabels(["#", "クエリ", "タイトル", "スコア", "本文取得", "URL (クリックで開く)"])
         self.sources_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.sources_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.sources_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.sources_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.sources_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.sources_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.sources_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.sources_table.cellDoubleClicked.connect(self._on_source_cell_clicked)
         sources_layout.addWidget(self.sources_table)
 
@@ -237,18 +274,101 @@ class MainWindow(QMainWindow):
     def _toggle_settings(self, checked: bool) -> None:
         self.settings_group.setVisible(checked)
 
+    def _on_refresh_models_clicked(self) -> None:
+        self._refresh_model_list(show_feedback=True)
+
+    def _refresh_model_list(self, show_feedback: bool = False) -> None:
+        """Fetch available models from the configured base_url (only on startup or button click)."""
+        base_url = self.base_url_edit.text().strip() or self.default_settings.base_url
+        api_key = self.api_key_edit.text().strip()
+        current_selection = self.model_combo.currentText().strip()
+
+        models = fetch_available_models(base_url=base_url, api_key=api_key, timeout=3.0)
+        if models:
+            self.model_combo.clear()
+            for m in models:
+                self.model_combo.addItem(m)
+            if current_selection and current_selection in models:
+                self.model_combo.setCurrentText(current_selection)
+            elif current_selection:
+                self.model_combo.addItem(current_selection)
+                self.model_combo.setCurrentText(current_selection)
+            else:
+                self.model_combo.setCurrentIndex(0)
+            if show_feedback:
+                QMessageBox.information(
+                    self, "モデル更新完了", f"LM Studio から {len(models)} 件のモデルを取得しました:\n\n" + "\n".join(models[:10])
+                )
+        else:
+            if show_feedback:
+                QMessageBox.warning(
+                    self,
+                    "モデル取得不可",
+                    f"エンドポイント ({base_url}) からモデル一覧を取得できませんでした。\nLM Studio が起動しているか確認してください。",
+                )
+
+    def _load_config(self) -> None:
+        if not os.path.exists(self.config_path):
+            return
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "model" in data:
+                self.model_combo.setCurrentText(data["model"])
+            if "base_url" in data:
+                self.base_url_edit.setText(data["base_url"])
+            if "api_key" in data:
+                self.api_key_edit.setText(data["api_key"])
+            if "max_concurrency" in data:
+                self.concurrency_spin.setValue(int(data["max_concurrency"]))
+            if "max_search_queries" in data:
+                self.max_queries_spin.setValue(int(data["max_search_queries"]))
+            if "max_search_rounds" in data:
+                self.max_rounds_spin.setValue(int(data["max_search_rounds"]))
+            if "fetch_web_content" in data:
+                self.fetch_content_cb.setChecked(bool(data["fetch_web_content"]))
+            if "max_content_length" in data:
+                self.max_content_length_spin.setValue(int(data["max_content_length"]))
+        except Exception:
+            pass
+
+    def _save_config(self) -> None:
+        data = {
+            "model": self.model_combo.currentText().strip(),
+            "base_url": self.base_url_edit.text().strip(),
+            "api_key": self.api_key_edit.text().strip(),
+            "max_concurrency": self.concurrency_spin.value(),
+            "max_search_queries": self.max_queries_spin.value(),
+            "max_search_rounds": self.max_rounds_spin.value(),
+            "fetch_web_content": self.fetch_content_cb.isChecked(),
+            "max_content_length": self.max_content_length_spin.value(),
+        }
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def closeEvent(self, event: Any) -> None:
+        self._save_config()
+        super().closeEvent(event)
+
     def _on_start_clicked(self) -> None:
         query = self.query_edit.toPlainText().strip()
         if not query:
             QMessageBox.warning(self, "入力エラー", "調査テーマまたは質問を入力してください。")
             return
 
+        self._save_config()
+
         settings = Settings(
-            model=self.model_edit.text().strip() or self.default_settings.model,
+            model=self.model_combo.currentText().strip() or self.default_settings.model,
             base_url=self.base_url_edit.text().strip() or self.default_settings.base_url,
             api_key=self.api_key_edit.text().strip() or self.default_settings.api_key,
             max_search_queries=self.max_queries_spin.value(),
             max_search_rounds=self.max_rounds_spin.value(),
+            fetch_web_content=self.fetch_content_cb.isChecked(),
+            max_content_length=self.max_content_length_spin.value(),
         )
         max_concurrency = self.concurrency_spin.value()
 
@@ -289,11 +409,13 @@ class MainWindow(QMainWindow):
             self.sources_table.insertRow(row)
 
             score_text = f"{item.relevance_score:.3f}" if item.relevance_score is not None else "-"
+            content_status = "✅ 取得済" if item.content else "➖ スニペットのみ"
             self.sources_table.setItem(row, 0, QTableWidgetItem(str(i)))
             self.sources_table.setItem(row, 1, QTableWidgetItem(item.query))
             self.sources_table.setItem(row, 2, QTableWidgetItem(item.title))
             self.sources_table.setItem(row, 3, QTableWidgetItem(score_text))
-            self.sources_table.setItem(row, 4, QTableWidgetItem(item.url))
+            self.sources_table.setItem(row, 4, QTableWidgetItem(content_status))
+            self.sources_table.setItem(row, 5, QTableWidgetItem(item.url))
 
         # Switch to summary tab
         self.tabs.setCurrentIndex(0)
@@ -315,7 +437,7 @@ class MainWindow(QMainWindow):
         self.log_edit.appendPlainText(f"[{timestamp}] {message}")
 
     def _on_source_cell_clicked(self, row: int, column: int) -> None:
-        url_item = self.sources_table.item(row, 4)
+        url_item = self.sources_table.item(row, 5)
         if url_item and url_item.text():
             QDesktopServices.openUrl(QUrl(url_item.text()))
 

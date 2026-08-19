@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 
 from search_orchestrator import (
+    DefaultWebContentFetcher,
     Evaluation,
     SearchPlan,
     SearchResult,
@@ -9,6 +10,9 @@ from search_orchestrator import (
     add_search_results,
     create_workflow,
     deduplicate_results,
+    fetch_available_models,
+    format_results_for_llm,
+    populate_content,
     rerank_results,
 )
 
@@ -50,6 +54,79 @@ def test_rerank_results_orders_and_limits() -> None:
     assert reranked[1].relevance_score == 0.5
 
 
+def test_default_web_content_fetcher_extracts_html_cleanly() -> None:
+    fetcher = DefaultWebContentFetcher()
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Test Page</title><style>.ads { color: red; }</style></head>
+    <body>
+        <header><nav><a href="/">Home</a></nav></header>
+        <main>
+            <h1>Main Title</h1>
+            <p>This is the first paragraph with important information.</p>
+            <script>console.log("ignore me");</script>
+        </main>
+        <footer><p>Copyright 2026</p></footer>
+    </body>
+    </html>
+    """
+    text = fetcher.extract_text_from_html(html, max_length=1000)
+    assert "Main Title" in text
+    assert "This is the first paragraph with important information." in text
+    assert "console.log" not in text
+    assert "Copyright" not in text
+
+
+def test_populate_content_updates_results() -> None:
+    class MockFetcher:
+        def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
+            if "fail" in url:
+                return ""
+            return f"Full page content from {url}"
+
+    results = [
+        SearchResult(query="q", title="A", url="https://example.com/a", snippet="snippet a"),
+        SearchResult(query="q", title="B", url="https://example.com/fail", snippet="snippet b"),
+    ]
+    updated = populate_content(results, MockFetcher())
+    assert len(updated) == 2
+    assert updated[0].content == "Full page content from https://example.com/a"
+    assert updated[0].fetch_status == "success"
+    assert updated[1].content is None
+    assert updated[1].fetch_status == "empty_or_failed"
+
+
+def test_format_results_for_llm_includes_content() -> None:
+    results = [
+        SearchResult(
+            query="q", title="A", url="https://example.com/a", snippet="snip",
+            content="Detailed body content here", relevance_score=0.95
+        )
+    ]
+    formatted = format_results_for_llm(results)
+    assert "【タイトル】: A [関連度スコア: 0.950]" in formatted
+    assert "【URL】: https://example.com/a" in formatted
+    assert "【概要/スニペット】: snip" in formatted
+    assert "【Webページ本文抜粋】:\nDetailed body content here" in formatted
+
+
+def test_parse_json_from_response() -> None:
+    from search_orchestrator import parse_json_from_response
+
+    # Markdown json block
+    text1 = 'Some preamble\n```json\n{"key": "value"}\n```\nSome postamble'
+    assert parse_json_from_response(text1) == {"key": "value"}
+
+    # Raw braces with surrounding text
+    text2 = 'Thought: let me output json: {"key": 123} Hope this helps.'
+    assert parse_json_from_response(text2) == {"key": 123}
+
+    # Direct JSON
+    text3 = '{"sufficient": true, "missing_information": []}'
+    assert parse_json_from_response(text3) == {"sufficient": True, "missing_information": []}
+
+
 def test_workflow_end_to_end_with_mocks() -> None:
     class MockSearch:
         def text(self, query: str, *, max_results: int):
@@ -62,40 +139,45 @@ def test_workflow_end_to_end_with_mocks() -> None:
         def predict(self, pairs: list[tuple[str, str]], **kwargs):
             return [0.8 for _ in pairs]
 
-    # Mock LLM
+    class MockFetcher:
+        def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
+            return f"Fetched body text for {url}"
+
+    # Mock LLM invoke return based on prompt content
     mock_llm = MagicMock()
-    mock_planner = MagicMock()
-    mock_planner.invoke.return_value = SearchPlan(
-        tasks=[
-            SearchTask(aspect="Aspect1", query="query1", reason="reason1"),
-            SearchTask(aspect="Aspect2", query="query2", reason="reason2"),
-        ]
-    )
-    mock_evaluator = MagicMock()
-    mock_evaluator.invoke.return_value = Evaluation(
-        sufficient=True,
-        missing_information=[],
-        weak_evidence=[],
-        reason="Sufficient info found",
-        additional_queries=[],
-    )
 
-    def with_structured_output_side_effect(schema):
-        if schema == SearchPlan:
-            return mock_planner
-        if schema == Evaluation:
-            return mock_evaluator
-        return MagicMock()
+    def llm_invoke_side_effect(prompt: str):
+        if "リサーチプランナー" in prompt:
+            return MagicMock(content='''```json
+{
+  "tasks": [
+    {"aspect": "Aspect1", "query": "query1", "reason": "reason1"},
+    {"aspect": "Aspect2", "query": "query2", "reason": "reason2"}
+  ]
+}
+```''')
+        elif "リサーチ品質評価担当" in prompt:
+            return MagicMock(content='''```json
+{
+  "sufficient": true,
+  "missing_information": [],
+  "weak_evidence": [],
+  "reason": "Sufficient info found",
+  "additional_queries": []
+}
+```''')
+        else:
+            return MagicMock(content="Final summary report with detailed web evidence.")
 
-    mock_llm.with_structured_output.side_effect = with_structured_output_side_effect
-    mock_llm.invoke.return_value = MagicMock(content="Final summary report.")
+    mock_llm.invoke.side_effect = llm_invoke_side_effect
 
-    settings = Settings(max_search_queries=2, max_search_rounds=1)
+    settings = Settings(max_search_queries=2, max_search_rounds=1, fetch_web_content=True)
     workflow = create_workflow(
         settings=settings,
         search=MockSearch(),
         reranker=MockReranker(),
         llm=mock_llm,
+        fetcher=MockFetcher(),
     )
 
     result = workflow.invoke({
@@ -104,7 +186,27 @@ def test_workflow_end_to_end_with_mocks() -> None:
         "summary": "", "search_query_count": 0, "search_round": 0,
     })
 
-    assert result["summary"] == "Final summary report."
+    assert result["summary"] == "Final summary report with detailed web evidence."
     assert len(result["results"]) > 0
+    assert any(r.content is not None for r in result["results"])
     assert result["evaluation"] is not None
     assert result["evaluation"].sufficient is True
+
+
+def test_fetch_available_models_with_mock() -> None:
+    from unittest.mock import patch
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-c"}]
+    }
+    mock_resp.raise_for_status.return_value = None
+
+    with patch("httpx.Client.get", return_value=mock_resp):
+        models = fetch_available_models("http://localhost:1234/v1")
+        assert models == ["model-a", "model-b", "model-c"]
+
+    # Test error handling returns empty list
+    with patch("httpx.Client.get", side_effect=Exception("Connection refused")):
+        models_err = fetch_available_models("http://localhost:1234/v1")
+        assert models_err == []

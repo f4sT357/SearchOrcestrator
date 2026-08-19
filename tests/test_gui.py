@@ -26,6 +26,9 @@ def test_gui_main_window_initialization() -> None:
     assert window.query_edit.toPlainText() != ""
     assert window.tabs.count() == 3
     assert window.start_btn.isEnabled()
+    assert window.model_combo is not None
+    assert window.model_combo.isEditable()
+    assert window.refresh_models_btn is not None
 
 
 def test_gui_worker_signal_connections() -> None:

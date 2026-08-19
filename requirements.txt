@@ -1,7 +1,8 @@
 ddgs
-langchain-openai
+httpx
+langchain>=0.2.0
 langgraph
-pydantic>=2
+lxml
+pydantic>2
 pyside6
 sentence-transformers
-

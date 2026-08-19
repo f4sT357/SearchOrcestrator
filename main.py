@@ -2,6 +2,13 @@
 
 import argparse
 import sys
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="Core Pydantic V1 functionality isn't compatible",
+    category=UserWarning,
+    module="langchain_core",
+)
 
 from search_orchestrator import Settings, create_workflow
 
@@ -23,21 +30,18 @@ def main() -> None:
     parser.add_argument("--base-url", help="OpenAI互換APIのエンドポイントURL")
     parser.add_argument("--api-key", help="APIキー")
     parser.add_argument("--max-concurrency", type=int, default=2, help="並列実行数の上限")
+    parser.add_argument("--no-fetch", action="store_true", help="Webページの本文取得を無効化する")
+    parser.add_argument("--max-content-length", type=int, default=3000, help="Webページ本文の最大取得文字数")
     args = parser.parse_args()
 
     settings = Settings.from_environment()
-    if args.model:
-        settings = Settings(
-            model=args.model,
-            base_url=args.base_url or settings.base_url,
-            api_key=args.api_key or settings.api_key,
-        )
-    elif args.base_url or args.api_key:
-        settings = Settings(
-            model=settings.model,
-            base_url=args.base_url or settings.base_url,
-            api_key=args.api_key or settings.api_key,
-        )
+    settings = Settings(
+        model=args.model or settings.model,
+        base_url=args.base_url or settings.base_url,
+        api_key=args.api_key or settings.api_key,
+        fetch_web_content=not args.no_fetch,
+        max_content_length=args.max_content_length,
+    )
 
     workflow = create_workflow(settings)
     result = workflow.invoke({

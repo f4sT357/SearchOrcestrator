@@ -1,4 +1,4 @@
-﻿"""Background worker thread for running the research workflow."""
+"""Background worker thread for running the research workflow."""
 
 from __future__ import annotations
 
@@ -39,7 +39,8 @@ class ResearchWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.log_signal.emit(f"ワークフローを初期化中... (モデル: {self.settings.model})")
+            fetch_mode_str = "有効" if self.settings.fetch_web_content else "無効"
+            self.log_signal.emit(f"ワークフローを初期化中... (モデル: {self.settings.model}, Webページ本文取得: {fetch_mode_str})")
             workflow = create_workflow(self.settings)
 
             self.log_signal.emit(f"調査を開始します: 「{self.query}」")

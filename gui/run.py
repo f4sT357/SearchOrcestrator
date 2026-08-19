@@ -1,4 +1,4 @@
-﻿"""Entry point for launching the Search Orchestrator PySide6 GUI."""
+"""Entry point for launching the Search Orchestrator PySide6 GUI."""
 
 import os
 import sys
@@ -16,7 +16,12 @@ from gui.main_window import MainWindow
 
 def main() -> None:
     # High DPI scaling support
-    app = QApplication(sys.argv)
+    from PySide6.QtGui import QFont
+
+    # Set a safe default font size to avoid QFont warnings
+    default_font = QFont()
+    default_font.setPointSize(10)
+    app.setFont(default_font)
     app.setApplicationName("Search Orchestrator")
     app.setApplicationDisplayName("Search Orchestrator")
 
