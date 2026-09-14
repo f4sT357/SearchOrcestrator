@@ -1,6 +1,7 @@
 ddgs
 httpx
 langchain>=0.2.0
+langchain-openai
 langgraph
 lxml
 pydantic>2
