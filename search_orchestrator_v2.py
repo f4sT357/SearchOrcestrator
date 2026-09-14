@@ -226,6 +226,9 @@ def create_workflow(
             return "analyze"
         if state.get("search_query_count", 0) >= settings.max_search_queries:
             return "analyze"
+        searched = {q.casefold() for q in state.get("searched_queries", [])}
+        if not any(q.casefold() not in searched for q in _unique_queries(evaluation.additional_queries)):
+            return "analyze"
         return "additional_search"
 
     def additional_search(state: State):
