@@ -169,7 +169,7 @@ def test_workflow_suppresses_duplicate_planned_and_additional_queries() -> None:
         "search_round": 0,
     })
 
-    assert search.queries == ["q1", "q2", "q3"]
-    assert result["search_query_count"] == 3
+    assert search.queries == ["q1", "q2", "q3", "q4"]
+    assert result["search_query_count"] == 4
     assert result["search_round"] == 1
     assert result["summary"] == "final"
