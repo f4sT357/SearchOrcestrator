@@ -1,7 +1,9 @@
 """Improved workflow controller for SearchOrcestrator."""
 from __future__ import annotations
 
+import json
 import operator
+import re
 from typing import Annotated, Any, TypedDict
 from urllib.parse import urlsplit, urlunsplit
 
@@ -95,6 +97,58 @@ def _make_result(task: SearchTask, item: dict) -> PlannedSearchResult | None:
     )
 
 
+def _deduplicate_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Deduplicate evidence using canonical URLs, preserving first occurrence."""
+    seen: set[str] = set()
+    unique: list[SearchResult] = []
+    for item in results:
+        key = _canonical_url(item.url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _safe_rerank(results: list[SearchResult], reranker: Reranker, top_k: int) -> list[SearchResult]:
+    """Rerank when possible, but retain search results if the model fails."""
+    if not results or top_k <= 0:
+        return []
+    try:
+        return rerank_results(results, reranker, top_k)
+    except Exception as error:
+        print(f"再ランキング失敗 (フォールバック適用): {error}")
+        return results[:top_k]
+
+
+def _parse_model_json(text: str) -> dict:
+    """Parse a JSON object even when the model wraps it in prose or code fences."""
+    candidates: list[str] = []
+    stripped = text.strip()
+    candidates.append(stripped)
+    candidates.extend(match.group(1).strip() for match in re.finditer(r"```(?:json)?\s*(.*?)\s*```", stripped, re.IGNORECASE | re.DOTALL))
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            pass
+
+        for match in re.finditer(r"\{", candidate):
+            try:
+                value, _ = decoder.raw_decode(candidate[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+
+    # Preserve the original parser's behavior for a final diagnostic exception.
+    return parse_json_from_response(text)
+
+
 def _format_evidence(results: list[SearchResult], plan: SearchPlan | None) -> str:
     parts = []
     for i, item in enumerate(results, 1):
@@ -148,7 +202,7 @@ def create_workflow(
 {{"tasks":[{{"aspect":"調査観点","query":"検索クエリ","reason":"検索理由"}}]}}
 """
         try:
-            data = parse_json_from_response(llm.invoke(prompt).content)
+            data = _parse_model_json(llm.invoke(prompt).content)
             plan = SearchPlan.model_validate(data)
         except Exception:
             plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
@@ -186,7 +240,7 @@ def create_workflow(
                     if key not in seen:
                         fresh.append(result)
                         seen.add(key)
-            top = rerank_results(fresh, reranker, settings.reranked_results_per_query)
+            top = _safe_rerank(fresh, reranker, settings.reranked_results_per_query)
             if fetcher:
                 top = populate_content(top, fetcher, timeout=settings.fetch_timeout,
                                        max_length=settings.max_content_length,
@@ -197,7 +251,7 @@ def create_workflow(
             return {"results": [], "search_query_count": 1, "searched_queries": [task.query]}
 
     def evaluate(state: State):
-        evidence = _format_evidence(deduplicate_results(state.get("results", [])), state.get("plan"))
+        evidence = _format_evidence(_deduplicate_results(state.get("results", [])), state.get("plan"))
         prompt = f"""あなたはリサーチ品質評価担当です。現在日: {date.today().isoformat()}
 質問: {state['query']}
 調査計画: {state['plan']}
@@ -209,7 +263,7 @@ def create_workflow(
 {{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"","additional_queries":[]}}
 """
         try:
-            evaluation = Evaluation.model_validate(parse_json_from_response(llm.invoke(prompt).content))
+            evaluation = Evaluation.model_validate(_parse_model_json(llm.invoke(prompt).content))
         except Exception:
             evaluation = Evaluation(sufficient=True, missing_information=[], weak_evidence=[],
                                     reason="評価パース失敗による安全フォールバック", additional_queries=[])
@@ -257,7 +311,7 @@ def create_workflow(
                     if key and key not in existing_urls:
                         fresh.append(result)
                         existing_urls.add(key)
-                top = rerank_results(fresh, reranker, settings.reranked_results_per_query)
+                top = _safe_rerank(fresh, reranker, settings.reranked_results_per_query)
                 if fetcher:
                     top = populate_content(top, fetcher, timeout=settings.fetch_timeout,
                                            max_length=settings.max_content_length,
@@ -269,7 +323,7 @@ def create_workflow(
                 "search_round": next_round, "searched_queries": queries}
 
     def analyze(state: State):
-        evidence = _format_evidence(deduplicate_results(state.get("results", [])), state.get("plan"))
+        evidence = _format_evidence(_deduplicate_results(state.get("results", [])), state.get("plan"))
         response = llm.invoke(f"""以下のWeb検索結果および取得したWebページ本文だけを根拠に質問へ回答してください。
 質問: {state['query']}
 
