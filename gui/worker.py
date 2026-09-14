@@ -8,13 +8,13 @@ from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
-# Ensure parent directory is in sys.path when running from gui/
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from search_orchestrator import Settings, create_workflow
+from search_orchestrator import Settings
+from search_orchestrator_v2 import create_workflow
 
 
 class ResearchWorker(QThread):
@@ -25,13 +25,7 @@ class ResearchWorker(QThread):
     error_signal = Signal(str)
     finished_signal = Signal()
 
-    def __init__(
-        self,
-        query: str,
-        settings: Settings,
-        max_concurrency: int = 2,
-        parent: Any = None,
-    ) -> None:
+    def __init__(self, query: str, settings: Settings, max_concurrency: int = 2, parent: Any = None) -> None:
         super().__init__(parent)
         self.query = query
         self.settings = settings
@@ -40,9 +34,10 @@ class ResearchWorker(QThread):
     def run(self) -> None:
         try:
             fetch_mode_str = "有効" if self.settings.fetch_web_content else "無効"
-            self.log_signal.emit(f"ワークフローを初期化中... (モデル: {self.settings.model}, Webページ本文取得: {fetch_mode_str})")
+            self.log_signal.emit(
+                f"ワークフローを初期化中... (モデル: {self.settings.model}, Webページ本文取得: {fetch_mode_str})"
+            )
             workflow = create_workflow(self.settings)
-
             self.log_signal.emit(f"調査を開始します: 「{self.query}」")
             initial_state = {
                 "query": self.query,
@@ -54,13 +49,8 @@ class ResearchWorker(QThread):
                 "search_query_count": 0,
                 "search_round": 0,
             }
-
             self.log_signal.emit("調査計画の立案およびWeb検索を実行中...")
-            result = workflow.invoke(
-                initial_state,
-                {"max_concurrency": self.max_concurrency},
-            )
-
+            result = workflow.invoke(initial_state, {"max_concurrency": self.max_concurrency})
             self.log_signal.emit("調査と回答生成が正常に完了しました。")
             self.result_signal.emit(result)
         except Exception as exc:
