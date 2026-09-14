@@ -10,19 +10,17 @@ warnings.filterwarnings(
     module="langchain_core",
 )
 
-from search_orchestrator import Settings, create_workflow
+from search_orchestrator import Settings
+from search_orchestrator_v2 import create_workflow
 
 
 def main() -> None:
-    # Local models can emit characters that the Windows CP932 console cannot
-    # represent. Use UTF-8 so a successful run does not fail while printing.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
     parser = argparse.ArgumentParser(description="AI搭載のWebリサーチオーケストレーター")
     parser.add_argument(
-        "query",
-        nargs="?",
+        "query", nargs="?",
         default="NVIDIAとAMDのAI GPU戦略について比較調査してください。",
         help="調査したい質問やテーマ",
     )
@@ -55,4 +53,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
