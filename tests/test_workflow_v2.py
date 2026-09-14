@@ -1,7 +1,11 @@
 from unittest.mock import MagicMock
 
-from search_orchestrator import Settings
-from search_orchestrator_v2 import create_workflow
+from search_orchestrator import Settings, SearchResult
+from search_orchestrator_v2 import (
+    _deduplicate_results,
+    _parse_model_json,
+    create_workflow,
+)
 
 
 def test_workflow_uses_total_query_budget_and_allows_additional_round() -> None:
@@ -154,3 +158,50 @@ def test_workflow_does_not_repeat_evaluation_when_only_duplicate_queries_are_sug
     assert search.queries == ["q1"]
     assert eval_calls == 1
     assert result["summary"] == "final"
+
+
+def test_evidence_dedup_uses_canonical_urls() -> None:
+    results = [
+        SearchResult(query="q1", title="First", url="HTTPS://Example.com/path#section", snippet="a"),
+        SearchResult(query="q2", title="Duplicate", url="https://example.com/path", snippet="b"),
+        SearchResult(query="q3", title="Other", url="https://example.com/other", snippet="c"),
+    ]
+    unique = _deduplicate_results(results)
+    assert [item.title for item in unique] == ["First", "Other"]
+
+
+def test_model_json_parser_handles_nested_json_after_prose() -> None:
+    text = '''モデルの説明です。\n```json\n{"tasks":[{"aspect":"A","query":"q1","reason":"reason with {braces}"}]}\n```'''
+    assert _parse_model_json(text)["tasks"][0]["query"] == "q1"
+
+
+def test_workflow_keeps_results_when_reranker_fails() -> None:
+    class MockSearch:
+        def text(self, query: str, *, max_results: int):
+            return [{"href": "https://example.com/result", "title": "Result", "body": "body"}]
+
+    class FailingReranker:
+        def predict(self, pairs, **kwargs):
+            raise RuntimeError("reranker unavailable")
+
+    llm = MagicMock()
+
+    def invoke(prompt: str):
+        if "リサーチプランナー" in prompt:
+            return MagicMock(content='{"tasks":[{"aspect":"A","query":"q1","reason":"r"}]}')
+        if "リサーチ品質評価担当" in prompt:
+            return MagicMock(content='{"sufficient":true,"missing_information":[],"weak_evidence":[],"reason":"enough","additional_queries":[]}')
+        return MagicMock(content="final")
+
+    llm.invoke.side_effect = invoke
+    workflow = create_workflow(
+        Settings(max_search_queries=1, max_search_rounds=1, fetch_web_content=False),
+        search=MockSearch(),
+        reranker=FailingReranker(),
+        llm=llm,
+    )
+    result = workflow.invoke({"query": "topic", "plan": None, "task": None, "results": [], "evaluation": None, "summary": "", "search_query_count": 0, "search_round": 0})
+
+    assert result["summary"] == "final"
+    assert len(result["results"]) == 1
+    assert result["results"][0].title == "Result"
