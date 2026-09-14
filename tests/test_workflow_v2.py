@@ -116,3 +116,60 @@ def test_workflow_stops_at_round_limit() -> None:
     assert result["search_round"] == 1
     assert eval_calls == 2
     assert result["summary"] == "final"
+
+
+def test_workflow_suppresses_duplicate_planned_and_additional_queries() -> None:
+    class MockSearch:
+        def __init__(self):
+            self.queries = []
+
+        def text(self, query: str, *, max_results: int):
+            self.queries.append(query)
+            return [{"href": f"https://example.com/{query}", "title": query, "body": "body"}]
+
+    class MockReranker:
+        def predict(self, pairs, **kwargs):
+            return [0.9 for _ in pairs]
+
+    llm = MagicMock()
+    eval_calls = 0
+
+    def invoke(prompt: str):
+        nonlocal eval_calls
+        if "リサーチプランナー" in prompt:
+            return MagicMock(content='''{"tasks":[
+                {"aspect":"A","query":"q1","reason":"r1"},
+                {"aspect":"A2","query":" Q1 ","reason":"duplicate"},
+                {"aspect":"B","query":"q2","reason":"r2"}
+            ]}''')
+        if "リサーチ品質評価担当" in prompt:
+            eval_calls += 1
+            if eval_calls == 1:
+                return MagicMock(content='''{"sufficient":false,
+                    "missing_information":["more"],"weak_evidence":[],
+                    "reason":"need more",
+                    "additional_queries":["q2"," q3 ","Q3"," ","q4"]}''')
+            return MagicMock(content='''{"sufficient":true,
+                "missing_information":[],"weak_evidence":[],
+                "reason":"enough","additional_queries":[]}''')
+        return MagicMock(content="final")
+
+    llm.invoke.side_effect = invoke
+    search = MockSearch()
+    workflow = create_workflow(
+        Settings(max_search_queries=4, max_search_rounds=2, fetch_web_content=False),
+        search=search,
+        reranker=MockReranker(),
+        llm=llm,
+    )
+
+    result = workflow.invoke({
+        "query": "topic", "plan": None, "task": None, "results": [],
+        "evaluation": None, "summary": "", "search_query_count": 0,
+        "search_round": 0,
+    })
+
+    assert search.queries == ["q1", "q2", "q3"]
+    assert result["search_query_count"] == 3
+    assert result["search_round"] == 1
+    assert result["summary"] == "final"
