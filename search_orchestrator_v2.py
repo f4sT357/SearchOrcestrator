@@ -6,6 +6,7 @@ from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
+from pydantic import Field
 
 from search_orchestrator import (
     Evaluation,
@@ -29,6 +30,12 @@ from search_orchestrator import (
 )
 
 
+class PlannedSearchResult(SearchResult):
+    """Search result carrying the plan aspect through reranking and fetching."""
+
+    aspect: str = Field(default="追加調査")
+
+
 class State(TypedDict):
     query: str
     plan: SearchPlan | None
@@ -40,11 +47,12 @@ class State(TypedDict):
     search_round: int
 
 
-def _make_result(task: SearchTask, item: dict) -> SearchResult | None:
+def _make_result(task: SearchTask, item: dict) -> PlannedSearchResult | None:
     url = item.get("href", "")
     if not url:
         return None
-    return SearchResult(
+    return PlannedSearchResult(
+        aspect=task.aspect,
         query=task.query,
         title=item.get("title", ""),
         url=url,
@@ -53,11 +61,11 @@ def _make_result(task: SearchTask, item: dict) -> SearchResult | None:
 
 
 def _format_evidence(results: list[SearchResult], plan: SearchPlan | None) -> str:
-    task_by_query = {task.query: task for task in plan.tasks} if plan else {}
     parts = []
     for i, item in enumerate(results, 1):
-        task = task_by_query.get(item.query)
-        aspect = task.aspect if task else "追加調査"
+        aspect = getattr(item, "aspect", None)
+        task = next((t for t in plan.tasks if t.query == item.query), None) if plan else None
+        aspect = aspect or (task.aspect if task else "追加調査")
         reason = task.reason if task else "評価で不足した情報を補完"
         score = f" [関連度スコア: {item.relevance_score:.3f}]" if item.relevance_score is not None else ""
         text = (
@@ -114,8 +122,6 @@ def create_workflow(
 
     def dispatch_searches(state: State):
         tasks = state["plan"].tasks if state["plan"] else []
-        # max_search_queries is the total budget; cap the initial fan-out so an
-        # evaluation round can still perform additional searches.
         initial_limit = min(settings.max_search_queries, 4)
         return [Send("search", {"task": task}) for task in tasks[:initial_limit]]
 
@@ -134,13 +140,9 @@ def create_workflow(
                     seen.add(result.url)
             top = rerank_results(fresh, reranker, settings.reranked_results_per_query)
             if fetcher:
-                top = populate_content(
-                    top,
-                    fetcher,
-                    timeout=settings.fetch_timeout,
-                    max_length=settings.max_content_length,
-                    fallback_fetcher=fallback_fetcher,
-                )
+                top = populate_content(top, fetcher, timeout=settings.fetch_timeout,
+                                       max_length=settings.max_content_length,
+                                       fallback_fetcher=fallback_fetcher)
             return {"results": top, "search_query_count": 1}
         except Exception as error:
             print(f"検索失敗 ({task.query}): {error}")
@@ -161,13 +163,8 @@ def create_workflow(
         try:
             evaluation = Evaluation.model_validate(parse_json_from_response(llm.invoke(prompt).content))
         except Exception:
-            evaluation = Evaluation(
-                sufficient=True,
-                missing_information=[],
-                weak_evidence=[],
-                reason="評価パース失敗による安全フォールバック",
-                additional_queries=[],
-            )
+            evaluation = Evaluation(sufficient=True, missing_information=[], weak_evidence=[],
+                                    reason="評価パース失敗による安全フォールバック", additional_queries=[])
         evaluation.sufficient = evaluation.sufficient and not (
             evaluation.missing_information or evaluation.weak_evidence or evaluation.additional_queries
         )
@@ -197,7 +194,8 @@ def create_workflow(
                 response = search.text(query, max_results=settings.results_per_query)
                 fresh: list[SearchResult] = []
                 for item in response:
-                    result = SearchResult(
+                    result = PlannedSearchResult(
+                        aspect="追加調査",
                         query=query,
                         title=item.get("title", ""),
                         url=item.get("href", ""),
@@ -208,21 +206,14 @@ def create_workflow(
                         existing_urls.add(result.url)
                 top = rerank_results(fresh, reranker, settings.reranked_results_per_query)
                 if fetcher:
-                    top = populate_content(
-                        top,
-                        fetcher,
-                        timeout=settings.fetch_timeout,
-                        max_length=settings.max_content_length,
-                        fallback_fetcher=fallback_fetcher,
-                    )
+                    top = populate_content(top, fetcher, timeout=settings.fetch_timeout,
+                                           max_length=settings.max_content_length,
+                                           fallback_fetcher=fallback_fetcher)
                 delta.extend(top)
             except Exception as error:
                 print(f"追加検索失敗 ({query}): {error}")
-        return {
-            "results": delta,
-            "search_query_count": len(queries),
-            "search_round": next_round,
-        }
+        return {"results": delta, "search_query_count": len(queries),
+                "search_round": next_round}
 
     def analyze(state: State):
         evidence = _format_evidence(deduplicate_results(state.get("results", [])), state.get("plan"))
@@ -245,11 +236,8 @@ def create_workflow(
     builder.add_edge(START, "planner")
     builder.add_conditional_edges("planner", dispatch_searches)
     builder.add_edge("search", "evaluate")
-    builder.add_conditional_edges(
-        "evaluate",
-        should_continue,
-        {"analyze": "analyze", "additional_search": "additional_search"},
-    )
+    builder.add_conditional_edges("evaluate", should_continue,
+                                  {"analyze": "analyze", "additional_search": "additional_search"})
     builder.add_edge("additional_search", "evaluate")
     builder.add_edge("analyze", END)
     return builder.compile()
