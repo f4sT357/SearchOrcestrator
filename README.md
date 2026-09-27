@@ -26,6 +26,10 @@ python -m pip install -r requirements-dev.txt
 $env:SEARCH_MODEL = "your-model-name"
 $env:SEARCH_BASE_URL = "http://localhost:1234/v1"
 $env:SEARCH_API_KEY = "your-api-key"
+# 合成スコアの重み（合計1.0）
+$env:SEARCH_WEIGHT_RELEVANCE = "0.50"
+$env:SEARCH_WEIGHT_TRUST = "0.30"
+$env:SEARCH_WEIGHT_FRESHNESS = "0.20"
 ```
 
 ## 実行とテスト
@@ -34,7 +38,7 @@ $env:SEARCH_API_KEY = "your-api-key"
 ```powershell
 python gui/run.py
 ```
-> PySide6 による GUI ウィンドウが起動します。クエリ入力、設定変更（モデル名、URL、並列数、Web本文取得のON/OFF、本文文字数など）、調査レポートの閲覧・コピー・ファイル保存、参照ソース一覧のテーブル表示（クリックでブラウザ表示、本文取得状況の確認）、リアルタイム実行ログの確認が可能です。
+> PySide6 による GUI ウィンドウが起動します。クエリ入力、設定変更（モデル名、URL、並列数、Web本文取得のON/OFF、本文文字数、関連度・信頼度・新鮮度の重みなど）、調査レポートの閲覧・コピー・ファイル保存、参照ソース一覧のテーブル表示（クリックでブラウザ表示、本文取得状況の確認）、リアルタイム実行ログの確認が可能です。スコアの重みは合計100%に設定してください。
 
 ### 2. CLI (コマンドライン) での実行
 ```powershell
@@ -47,7 +51,10 @@ python main.py "最新の生成AIトレンドについて調査してくださ�
 # オプション指定（モデル名、エンドポイント、Web取得無効化などの指定）
 python main.py --model "my-model" --base-url "http://localhost:1234/v1" "調査テーマ"
 python main.py --no-fetch "スニペットのみで高速実行したい場合"
+python main.py --weight-relevance 0.4 --weight-trust 0.4 --weight-freshness 0.2 "調査テーマ"
 ```
+
+品質評価では一次情報を優先します。一次情報を確認できないテーマでは、二次情報という理由だけで根拠を退けず、独立した発行元による複数の高品質な情報源、記事間の転載関係、主張の一致や矛盾を照合します。最終候補では同一ホストの結果に偏らないよう異なるホストを優先します。登録リスト外のドメインは低品質とはみなさず、中立の信頼度スコアで順位付けして内容評価に委ねます。重み設定は関連度・信頼度・新鮮度の順で、各値は0から1、合計は1にしてください。
 
 ### 3. テストの実行
 ```powershell

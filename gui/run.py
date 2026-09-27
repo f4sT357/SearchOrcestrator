@@ -18,6 +18,8 @@ def main() -> None:
     # High DPI scaling support
     from PySide6.QtGui import QFont
 
+    app = QApplication(sys.argv)
+
     # Set a safe default font size to avoid QFont warnings
     default_font = QFont()
     default_font.setPointSize(10)

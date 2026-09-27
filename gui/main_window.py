@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -168,6 +169,29 @@ class MainWindow(QMainWindow):
 
         settings_layout.addRow("実行制御:", num_row)
 
+        weights_row = QHBoxLayout()
+        self.relevance_weight_spin = QDoubleSpinBox(self)
+        self.trust_weight_spin = QDoubleSpinBox(self)
+        self.freshness_weight_spin = QDoubleSpinBox(self)
+        for spin, value in (
+            (self.relevance_weight_spin, self.default_settings.relevance_weight * 100),
+            (self.trust_weight_spin, self.default_settings.trust_weight * 100),
+            (self.freshness_weight_spin, self.default_settings.freshness_weight * 100),
+        ):
+            spin.setRange(0, 100)
+            spin.setDecimals(0)
+            spin.setSingleStep(5)
+            spin.setSuffix("%")
+            spin.setValue(value)
+        weights_row.addWidget(QLabel("関連度"))
+        weights_row.addWidget(self.relevance_weight_spin)
+        weights_row.addWidget(QLabel("信頼度"))
+        weights_row.addWidget(self.trust_weight_spin)
+        weights_row.addWidget(QLabel("新鮮度"))
+        weights_row.addWidget(self.freshness_weight_spin)
+        weights_row.addStretch()
+        settings_layout.addRow("ソース順位の重み（合計100%）:", weights_row)
+
         # Web Fetch Options
         web_row = QHBoxLayout()
         self.fetch_content_cb = QCheckBox("Webページ本文を実際に取得して精読する", self)
@@ -257,7 +281,7 @@ class MainWindow(QMainWindow):
 
         self.log_edit = QPlainTextEdit(self)
         self.log_edit.setReadOnly(True)
-        self.log_edit.setPlaceholderText("実行ログがここに表示されます...")
+        self.log_edit.setPlaceholderText("計画・検索・ソース選定・品質評価・次の処理を選んだ理由がここに表示されます...")
         log_layout.addWidget(self.log_edit)
 
         log_actions = QHBoxLayout()
@@ -267,7 +291,7 @@ class MainWindow(QMainWindow):
         log_actions.addStretch()
         log_layout.addLayout(log_actions)
 
-        self.tabs.addTab(log_tab, "📋 実行ログ")
+        self.tabs.addTab(log_tab, "🔎 詳細実行ログ")
 
         main_layout.addWidget(self.tabs, stretch=1)
 
@@ -329,6 +353,12 @@ class MainWindow(QMainWindow):
                 self.fetch_content_cb.setChecked(bool(data["fetch_web_content"]))
             if "max_content_length" in data:
                 self.max_content_length_spin.setValue(int(data["max_content_length"]))
+            if "relevance_weight" in data:
+                self.relevance_weight_spin.setValue(float(data["relevance_weight"]) * 100)
+            if "trust_weight" in data:
+                self.trust_weight_spin.setValue(float(data["trust_weight"]) * 100)
+            if "freshness_weight" in data:
+                self.freshness_weight_spin.setValue(float(data["freshness_weight"]) * 100)
         except Exception:
             pass
 
@@ -342,6 +372,9 @@ class MainWindow(QMainWindow):
             "max_search_rounds": self.max_rounds_spin.value(),
             "fetch_web_content": self.fetch_content_cb.isChecked(),
             "max_content_length": self.max_content_length_spin.value(),
+            "relevance_weight": self.relevance_weight_spin.value() / 100,
+            "trust_weight": self.trust_weight_spin.value() / 100,
+            "freshness_weight": self.freshness_weight_spin.value() / 100,
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -359,6 +392,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "入力エラー", "調査テーマまたは質問を入力してください。")
             return
 
+        weight_total = (
+            self.relevance_weight_spin.value()
+            + self.trust_weight_spin.value()
+            + self.freshness_weight_spin.value()
+        )
+        if weight_total != 100:
+            QMessageBox.warning(self, "設定エラー", "ソース順位の重みの合計を100%にしてください。")
+            return
+
         self._save_config()
 
         settings = Settings(
@@ -369,6 +411,9 @@ class MainWindow(QMainWindow):
             max_search_rounds=self.max_rounds_spin.value(),
             fetch_web_content=self.fetch_content_cb.isChecked(),
             max_content_length=self.max_content_length_spin.value(),
+            relevance_weight=self.relevance_weight_spin.value() / 100,
+            trust_weight=self.trust_weight_spin.value() / 100,
+            freshness_weight=self.freshness_weight_spin.value() / 100,
         )
         max_concurrency = self.concurrency_spin.value()
 
