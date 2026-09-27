@@ -1,10 +1,18 @@
 {
-  "model": "lfm2.5-8b-a1b",
+  "model": "qwen3.5-4b-claude-opus-reasoning-distill-i1",
   "base_url": "http://localhost:1234/v1",
-  "api_key": "lm-studio",
-  "max_concurrency": 5,
+  "max_concurrency": 20,
   "max_search_queries": 15,
-  "max_search_rounds": 5,
+  "max_search_rounds": 10,
+  "results_per_query": 5,
+  "content_candidate_results_per_query": 3,
+  "reranked_results_per_query": 2,
   "fetch_web_content": true,
-  "max_content_length": 4000
+  "use_fallback_fetcher": false,
+  "content_fetcher": "firecrawl",
+  "firecrawl_api_url": "http://localhost:3002",
+  "max_content_length": 3500,
+  "relevance_weight": 0.5,
+  "trust_weight": 0.3,
+  "freshness_weight": 0.2
 }
