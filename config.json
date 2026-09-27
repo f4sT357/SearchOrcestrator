@@ -11,7 +11,7 @@
   "use_fallback_fetcher": false,
   "content_fetcher": "firecrawl",
   "firecrawl_api_url": "http://localhost:3002",
-  "max_content_length": 3500,
+  "max_content_length": 9999,
   "relevance_weight": 0.5,
   "trust_weight": 0.3,
   "freshness_weight": 0.2

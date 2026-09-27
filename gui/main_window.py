@@ -158,19 +158,29 @@ class MainWindow(QMainWindow):
         self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.model_combo.addItem(self.default_settings.model)
         self.model_combo.setCurrentText(self.default_settings.model)
+        self.model_combo.setToolTip(
+            "調査計画・品質評価・レポート作成に使うLLMです。"
+            "下のBase URLで指定したAPIから利用できるモデル名を選ぶか入力してください。"
+        )
         model_row.addWidget(self.model_combo, stretch=1)
 
         self.refresh_models_btn = QPushButton("🔄 AIモデル一覧を更新", self)
         self.refresh_models_btn.setObjectName("secondaryBtn")
         self.refresh_models_btn.clicked.connect(self._on_refresh_models_clicked)
+        self.refresh_models_btn.setToolTip("Base URLに接続し、利用可能なモデル名を読み直します。")
         model_row.addWidget(self.refresh_models_btn)
 
         settings_layout.addRow("LLMモデル名:", model_row)
 
         self.base_url_edit = QLineEdit(self.default_settings.base_url, self)
+        self.base_url_edit.setToolTip(
+            "LLM APIの接続先です。OpenAI互換APIのURLを入力します。"
+            "LM Studioでは通常 http://localhost:1234/v1 の形式です。"
+        )
         settings_layout.addRow("Base URL (APIエンドポイント):", self.base_url_edit)
 
         self.api_key_edit = QLineEdit(self.default_settings.api_key, self)
+        self.api_key_edit.setToolTip("LLM APIの認証キーです。認証不要のローカルAPIでは既定値のままで構いません。")
         settings_layout.addRow("APIキー:", self.api_key_edit)
 
         # Numeric Options
@@ -178,19 +188,34 @@ class MainWindow(QMainWindow):
         self.concurrency_spin = QSpinBox(self)
         self.concurrency_spin.setRange(1, 32)
         self.concurrency_spin.setValue(self.default_settings.max_concurrency)
-        num_row.addWidget(QLabel("並列実行数:"))
+        self.concurrency_spin.setToolTip(
+            "同時に実行するWeb検索の数です。増やすと速くなる場合がありますが、"
+            "検索サービスや本文取得先への負荷も増えます。"
+        )
+        concurrency_label = QLabel("並列実行数:")
+        concurrency_label.setToolTip(self.concurrency_spin.toolTip())
+        num_row.addWidget(concurrency_label)
         num_row.addWidget(self.concurrency_spin)
 
         self.max_queries_spin = QSpinBox(self)
         self.max_queries_spin.setRange(1, 100)
         self.max_queries_spin.setValue(self.default_settings.max_search_queries)
-        num_row.addWidget(QLabel("最大検索クエリ数:"))
+        self.max_queries_spin.setToolTip("初回検索と追加検索を合わせた、調査全体の検索語句数の上限です。")
+        queries_label = QLabel("最大検索クエリ数:")
+        queries_label.setToolTip(self.max_queries_spin.toolTip())
+        num_row.addWidget(queries_label)
         num_row.addWidget(self.max_queries_spin)
 
         self.max_rounds_spin = QSpinBox(self)
         self.max_rounds_spin.setRange(1, 20)
         self.max_rounds_spin.setValue(self.default_settings.max_search_rounds)
-        num_row.addWidget(QLabel("最大検索ラウンド数:"))
+        self.max_rounds_spin.setToolTip(
+            "検索して本文を評価する追加調査の繰り返し回数の上限です。"
+            "情報不足と判断された場合に次の検索語を作ります。"
+        )
+        rounds_label = QLabel("最大検索ラウンド数:")
+        rounds_label.setToolTip(self.max_rounds_spin.toolTip())
+        num_row.addWidget(rounds_label)
         num_row.addWidget(self.max_rounds_spin)
         num_row.addStretch()
 
@@ -200,19 +225,37 @@ class MainWindow(QMainWindow):
         self.results_per_query_spin = QSpinBox(self)
         self.results_per_query_spin.setRange(1, 100)
         self.results_per_query_spin.setValue(self.default_settings.results_per_query)
-        candidate_row.addWidget(QLabel("検索取得数:"))
+        self.results_per_query_spin.setToolTip(
+            "検索サービスから、検索語句1つにつき何件の候補を受け取るかです。"
+            "件数を増やすと、順位付け対象も増えます。"
+        )
+        results_label = QLabel("検索取得数:")
+        results_label.setToolTip(self.results_per_query_spin.toolTip())
+        candidate_row.addWidget(results_label)
         candidate_row.addWidget(self.results_per_query_spin)
 
         self.content_candidates_spin = QSpinBox(self)
         self.content_candidates_spin.setRange(1, 100)
         self.content_candidates_spin.setValue(self.default_settings.content_candidate_results_per_query)
-        candidate_row.addWidget(QLabel("本文取得候補数:"))
+        self.content_candidates_spin.setToolTip(
+            "検索候補のうち、ページ本文を取得して品質評価にも読ませる件数です。"
+            "最終採用数より多くすると、少し順位が低い候補も本文で比較できます。"
+        )
+        content_candidates_label = QLabel("本文取得候補数:")
+        content_candidates_label.setToolTip(self.content_candidates_spin.toolTip())
+        candidate_row.addWidget(content_candidates_label)
         candidate_row.addWidget(self.content_candidates_spin)
 
         self.final_results_spin = QSpinBox(self)
         self.final_results_spin.setRange(1, 100)
         self.final_results_spin.setValue(self.default_settings.reranked_results_per_query)
-        candidate_row.addWidget(QLabel("最終採用数:"))
+        self.final_results_spin.setToolTip(
+            "検索語句1つにつき、最終レポートの出典として残す件数です。"
+            "品質評価用に読む本文候補数とは別の設定です。"
+        )
+        final_results_label = QLabel("最終採用数:")
+        final_results_label.setToolTip(self.final_results_spin.toolTip())
+        candidate_row.addWidget(final_results_label)
         candidate_row.addWidget(self.final_results_spin)
         candidate_row.addStretch()
         settings_layout.addRow("検索候補数:", candidate_row)
@@ -223,21 +266,40 @@ class MainWindow(QMainWindow):
         self.relevance_weight_spin = QDoubleSpinBox(self)
         self.trust_weight_spin = QDoubleSpinBox(self)
         self.freshness_weight_spin = QDoubleSpinBox(self)
-        for spin, value in (
-            (self.relevance_weight_spin, self.default_settings.relevance_weight * 100),
-            (self.trust_weight_spin, self.default_settings.trust_weight * 100),
-            (self.freshness_weight_spin, self.default_settings.freshness_weight * 100),
+        for spin, value, description in (
+            (
+                self.relevance_weight_spin,
+                self.default_settings.relevance_weight * 100,
+                "検索語句との関連度を順位に反映する割合です。",
+            ),
+            (
+                self.trust_weight_spin,
+                self.default_settings.trust_weight * 100,
+                "情報源の信頼度を順位に反映する割合です。未登録のサイトは中立評価になります。",
+            ),
+            (
+                self.freshness_weight_spin,
+                self.default_settings.freshness_weight * 100,
+                "ページの新しさを順位に反映する割合です。更新時期が重要な調査で上げます。",
+            ),
         ):
             spin.setRange(0, 100)
             spin.setDecimals(0)
             spin.setSingleStep(5)
             spin.setSuffix("%")
             spin.setValue(value)
-        weights_row.addWidget(QLabel("関連度"))
+            spin.setToolTip(description)
+        relevance_label = QLabel("関連度")
+        relevance_label.setToolTip(self.relevance_weight_spin.toolTip())
+        weights_row.addWidget(relevance_label)
         weights_row.addWidget(self.relevance_weight_spin)
-        weights_row.addWidget(QLabel("信頼度"))
+        trust_label = QLabel("信頼度")
+        trust_label.setToolTip(self.trust_weight_spin.toolTip())
+        weights_row.addWidget(trust_label)
         weights_row.addWidget(self.trust_weight_spin)
-        weights_row.addWidget(QLabel("新鮮度"))
+        freshness_label = QLabel("新鮮度")
+        freshness_label.setToolTip(self.freshness_weight_spin.toolTip())
+        weights_row.addWidget(freshness_label)
         weights_row.addWidget(self.freshness_weight_spin)
         weights_row.addStretch()
         settings_layout.addRow("ソース順位の重み（合計100%）:", weights_row)
@@ -246,18 +308,31 @@ class MainWindow(QMainWindow):
         web_row = QHBoxLayout()
         self.fetch_content_cb = QCheckBox("Webページ本文を実際に取得して精読する", self)
         self.fetch_content_cb.setChecked(self.default_settings.fetch_web_content)
+        self.fetch_content_cb.setToolTip(
+            "検索結果の見出しや概要だけでなく、ページ本文も取得して品質評価とレポート作成に使います。"
+        )
         web_row.addWidget(self.fetch_content_cb)
 
         self.jina_fallback_cb = QCheckBox(
             "失敗時にJina Readerを使う（URLを外部サービスへ送信）", self
         )
         self.jina_fallback_cb.setChecked(self.default_settings.use_fallback_fetcher)
+        self.jina_fallback_cb.setToolTip(
+            "通常の本文取得に失敗したURLをJina Readerへ送って再取得します。"
+            "URLが外部サービスに送信されるため、必要な場合だけ有効にしてください。"
+        )
 
         self.max_content_length_spin = QSpinBox(self)
         self.max_content_length_spin.setRange(500, 10000)
         self.max_content_length_spin.setSingleStep(500)
         self.max_content_length_spin.setValue(self.default_settings.max_content_length)
-        web_row.addWidget(QLabel("本文最大文字数:"))
+        self.max_content_length_spin.setToolTip(
+            "1ページから取得する本文の最大文字数です。長くすると詳細が残りますが、"
+            "LLMへ渡す文章量も増えます。全ページ合計には別途上限があります。"
+        )
+        content_length_label = QLabel("本文最大文字数:")
+        content_length_label.setToolTip(self.max_content_length_spin.toolTip())
+        web_row.addWidget(content_length_label)
         web_row.addWidget(self.max_content_length_spin)
         web_row.addStretch()
 
@@ -267,6 +342,10 @@ class MainWindow(QMainWindow):
         self.fetcher_combo = QComboBox(self)
         self.fetcher_combo.addItem("標準取得 (httpx / lxml)", "builtin")
         self.fetcher_combo.addItem("Firecrawl セルフホスト", "firecrawl")
+        self.fetcher_combo.setToolTip(
+            "Web本文の取得方法です。標準取得はアプリから直接ページを読み込み、"
+            "Firecrawlは指定したセルフホストAPIを使います。"
+        )
         fetcher_index = self.fetcher_combo.findData(self.default_settings.content_fetcher)
         if fetcher_index >= 0:
             self.fetcher_combo.setCurrentIndex(fetcher_index)
@@ -274,11 +353,13 @@ class MainWindow(QMainWindow):
 
         self.firecrawl_url_edit = QLineEdit(self.default_settings.firecrawl_api_url, self)
         self.firecrawl_url_edit.setPlaceholderText("http://localhost:3002")
+        self.firecrawl_url_edit.setToolTip("Firecrawlを選んだ場合に接続するAPIのURLです。例: http://localhost:3002")
         settings_layout.addRow("Firecrawl API URL:", self.firecrawl_url_edit)
 
         self.firecrawl_api_key_edit = QLineEdit(self.default_settings.firecrawl_api_key, self)
         self.firecrawl_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.firecrawl_api_key_edit.setPlaceholderText("不要なセルフホスト構成では空欄")
+        self.firecrawl_api_key_edit.setToolTip("APIキー認証を設定したFirecrawlサーバーで使います。不要なら空欄にします。")
         settings_layout.addRow("Firecrawl APIキー (任意):", self.firecrawl_api_key_edit)
         main_layout.addWidget(self.settings_group)
 
