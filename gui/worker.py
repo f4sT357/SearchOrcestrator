@@ -6,7 +6,7 @@ import sys
 import os
 from typing import Any
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
 # Ensure parent directory is in sys.path when running from gui/
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -14,7 +14,36 @@ parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from search_orchestrator import Settings, create_workflow
+from search_orchestrator import Settings, create_workflow, preload_reranker
+
+
+class RerankerPreloadSignals(QObject):
+    ready = Signal()
+    failed = Signal(str)
+
+
+def preload_reranker_background(model_name: str, signals: RerankerPreloadSignals) -> None:
+    """Warm the reranker cache without blocking the GUI event loop."""
+    try:
+        preload_reranker(model_name)
+    except Exception as exc:
+        signals.failed.emit(str(exc))
+    else:
+        signals.ready.emit()
+
+
+def _fetch_settings_summary(settings: Settings) -> str:
+    """Describe the effective body-fetch configuration without exposing secrets."""
+    engine_names = {
+        "builtin": "標準取得 (httpx / lxml)",
+        "firecrawl": "Firecrawl セルフホスト",
+    }
+    engine_name = engine_names.get(settings.content_fetcher, settings.content_fetcher)
+    fetch_status = "有効" if settings.fetch_web_content else "無効"
+    summary = f"本文取得: {fetch_status} / エンジン: {engine_name}"
+    if settings.content_fetcher == "firecrawl":
+        summary += f" / API URL: {settings.firecrawl_api_url}"
+    return summary
 
 
 class ResearchWorker(QThread):
@@ -39,8 +68,10 @@ class ResearchWorker(QThread):
 
     def run(self) -> None:
         try:
-            fetch_mode_str = "有効" if self.settings.fetch_web_content else "無効"
-            self.log_signal.emit(f"ワークフローを初期化中... (モデル: {self.settings.model}, Webページ本文取得: {fetch_mode_str})")
+            fetch_settings = _fetch_settings_summary(self.settings)
+            self.log_signal.emit(
+                f"ワークフローを初期化中... (モデル: {self.settings.model}, {fetch_settings})"
+            )
             workflow = create_workflow(self.settings, log=self.log_signal.emit)
 
             self.log_signal.emit(f"調査を開始します: 「{self.query}」")
@@ -49,10 +80,12 @@ class ResearchWorker(QThread):
                 "plan": None,
                 "task": None,
                 "results": [],
+                "evidence_results": [],
                 "evaluation": None,
                 "summary": "",
                 "search_query_count": 0,
                 "search_round": 0,
+                "searched_queries": [],
             }
 
             self.log_signal.emit("調査計画の立案およびWeb検索を実行中...")

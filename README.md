@@ -30,7 +30,12 @@ $env:SEARCH_API_KEY = "your-api-key"
 $env:SEARCH_WEIGHT_RELEVANCE = "0.50"
 $env:SEARCH_WEIGHT_TRUST = "0.30"
 $env:SEARCH_WEIGHT_FRESHNESS = "0.20"
+$env:FIRECRAWL_API_URL = "http://localhost:3002"
+# APIキーが必要な構成の場合のみ設定
+$env:FIRECRAWL_API_KEY = "your-firecrawl-key"
 ```
+
+設定は既定値、`config.json`、環境変数、CLI オプションの順で上書きされます。GUI と CLI は同じ `config.json` を読み込みます。API キーは `SEARCH_API_KEY` で渡す方法を推奨します。GUI は入力した API キーを設定ファイルへ保存しません。
 
 ## 実行とテスト
 
@@ -52,7 +57,22 @@ python main.py "最新の生成AIトレンドについて調査してくださ�
 python main.py --model "my-model" --base-url "http://localhost:1234/v1" "調査テーマ"
 python main.py --no-fetch "スニペットのみで高速実行したい場合"
 python main.py --weight-relevance 0.4 --weight-trust 0.4 --weight-freshness 0.2 "調査テーマ"
+python main.py --max-search-queries 10 --max-search-rounds 2 "調査テーマ"
+python main.py --results-per-query 8 --content-candidate-results-per-query 5 --reranked-results-per-query 3 "調査テーマ"
+python main.py --content-fetcher firecrawl --firecrawl-url "http://localhost:3002" "調査テーマ"
 ```
+
+本文取得に失敗した場合、Jina Reader へ URL を送信して再取得する機能は既定で無効です。利用する場合は GUI の「Webアクセス」設定、または CLI の `--jina-fallback` で明示的に有効化できます。
+
+### Firecrawl セルフホストを本文取得に使う
+
+Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。
+
+API は `http://localhost:3002` で、この PC からだけ接続できます。GUI の詳細設定で本文取得エンジンを「Firecrawl セルフホスト」に変更し、API URL を指定します。API キーは `FIRECRAWL_API_KEY` 環境変数から読み込み、GUI の設定ファイルには保存しません。CLI では `--content-fetcher firecrawl` と `--firecrawl-url` を指定できます。
+
+停止スクリプトは Firecrawl のコンテナを停止します。Docker Desktop 自体は他のコンテナに影響しないよう起動したままにします。
+
+アプリは Firecrawl の `POST /v2/scrape` に Markdown 取得を依頼します。セルフホスト手順とサービス構成は [Firecrawl の公式ガイド](https://github.com/firecrawl/firecrawl/blob/main/SELF_HOST.md) を参照してください。
 
 品質評価では一次情報を優先します。一次情報を確認できないテーマでは、二次情報という理由だけで根拠を退けず、独立した発行元による複数の高品質な情報源、記事間の転載関係、主張の一致や矛盾を照合します。最終候補では同一ホストの結果に偏らないよう異なるホストを優先します。登録リスト外のドメインは低品質とはみなさず、中立の信頼度スコアで順位付けして内容評価に委ねます。重み設定は関連度・信頼度・新鮮度の順で、各値は0から1、合計は1にしてください。
 

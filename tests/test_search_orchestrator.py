@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 from datetime import date
+import json
 
 from search_orchestrator import (
     DefaultWebContentFetcher,
@@ -29,6 +30,77 @@ def test_add_search_results_ignores_duplicate_urls() -> None:
     ], "new query")
     assert added == 1
     assert [result.url for result in results] == ["https://example.com", "https://other.example"]
+
+
+def test_settings_load_config_then_environment_overrides(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "model": "config-model",
+        "max_concurrency": 4,
+        "max_search_queries": 12,
+        "max_search_rounds": 3,
+        "fetch_web_content": False,
+        "use_fallback_fetcher": True,
+        "max_content_length": 4500,
+        "content_fetcher": "firecrawl",
+        "firecrawl_api_url": "http://firecrawl.local:3002",
+        "firecrawl_api_key": "must-not-load-from-file",
+    }), encoding="utf-8")
+    for name in (
+        "SEARCH_MODEL", "SEARCH_BASE_URL", "SEARCH_API_KEY",
+        "SEARCH_WEIGHT_RELEVANCE", "SEARCH_WEIGHT_TRUST", "SEARCH_WEIGHT_FRESHNESS",
+        "FIRECRAWL_API_URL", "FIRECRAWL_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SEARCH_MODEL", "environment-model")
+    monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "environment-firecrawl-key")
+
+    settings = Settings.from_environment(config_path)
+
+    assert settings.model == "environment-model"
+    assert settings.max_concurrency == 4
+    assert settings.max_search_queries == 12
+    assert settings.max_search_rounds == 3
+    assert settings.fetch_web_content is False
+    assert settings.use_fallback_fetcher is True
+    assert settings.max_content_length == 4500
+    assert settings.content_fetcher == "firecrawl"
+    assert settings.firecrawl_api_url == "http://localhost:3002"
+    assert settings.firecrawl_api_key == "environment-firecrawl-key"
+
+
+def test_settings_default_external_fallback_is_disabled(tmp_path, monkeypatch) -> None:
+    for name in (
+        "SEARCH_MODEL", "SEARCH_BASE_URL", "SEARCH_API_KEY",
+        "SEARCH_WEIGHT_RELEVANCE", "SEARCH_WEIGHT_TRUST", "SEARCH_WEIGHT_FRESHNESS",
+        "FIRECRAWL_API_URL", "FIRECRAWL_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_environment(tmp_path / "missing.json")
+    assert settings.use_fallback_fetcher is False
+    assert settings.firecrawl_api_key == ""
+
+
+def test_workflow_uses_configured_firecrawl_fetcher(monkeypatch) -> None:
+    from unittest.mock import patch
+
+    settings = Settings(
+        content_fetcher="firecrawl",
+        firecrawl_api_url="http://localhost:3300",
+        firecrawl_api_key="test-key",
+    )
+    with patch("search_orchestrator.FirecrawlFetcher") as fetcher_class:
+        create_workflow(
+            settings=settings,
+            search=MagicMock(),
+            reranker=MagicMock(),
+            llm=MagicMock(),
+        )
+    fetcher_class.assert_called_once_with(
+        api_url="http://localhost:3300",
+        api_key="test-key",
+    )
 
 
 def test_deduplicate_results_removes_empty_and_duplicate_urls() -> None:

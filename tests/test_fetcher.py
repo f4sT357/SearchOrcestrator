@@ -12,6 +12,7 @@ import pytest
 
 from search_orchestrator import (
     DefaultWebContentFetcher,
+    FirecrawlFetcher,
     FetchError,
     FetchStatus,
     SearchResult,
@@ -100,6 +101,66 @@ class TestDefaultWebContentFetcher:
             with pytest.raises(FetchError) as exc_info:
                 fetcher.fetch("http://example.com")
         assert exc_info.value.status == FetchStatus.CONNECTION_ERROR
+
+
+class TestFirecrawlFetcher:
+    def test_fetch_posts_markdown_request_and_truncates_result(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "success": True,
+            "data": {"markdown": "# Firecrawl result"},
+        }
+        with patch("httpx.Client") as mock_client:
+            client = mock_client.return_value.__enter__.return_value
+            client.post.return_value = response
+            fetcher = FirecrawlFetcher("http://localhost:3002", "test-key")
+            result = fetcher.fetch("https://example.com/page", max_length=8)
+
+        assert result == "# Firecr"
+        mock_client.assert_called_once()
+        assert mock_client.call_args.kwargs["timeout"] == 30.0
+        client.post.assert_called_once_with(
+            "http://localhost:3002/v2/scrape",
+            json={
+                "url": "https://example.com/page",
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+            },
+        )
+        assert client.post.call_args.kwargs == {
+            "json": {
+                "url": "https://example.com/page",
+                "formats": ["markdown"],
+                "onlyMainContent": True,
+            },
+        }
+        assert mock_client.call_args.kwargs["headers"]["Authorization"] == "Bearer test-key"
+
+    def test_fetch_accepts_v2_base_url_and_requires_markdown(self):
+        response = MagicMock()
+        response.json.return_value = {"success": True, "data": {"html": "<p>x</p>"}}
+        with patch("httpx.Client") as mock_client:
+            client = mock_client.return_value.__enter__.return_value
+            client.post.return_value = response
+            fetcher = FirecrawlFetcher("http://localhost:3002/v2")
+            with pytest.raises(FetchError) as exc_info:
+                fetcher.fetch("https://example.com")
+        assert client.post.call_args.args[0] == "http://localhost:3002/v2/scrape"
+        assert exc_info.value.status == FetchStatus.PARSE_ERROR
+
+    def test_fetch_raises_on_api_error_response(self):
+        response = MagicMock()
+        response.json.return_value = {"success": False, "error": "page failed"}
+        with patch("httpx.Client") as mock_client:
+            client = mock_client.return_value.__enter__.return_value
+            client.post.return_value = response
+            with pytest.raises(FetchError) as exc_info:
+                FirecrawlFetcher().fetch("https://example.com")
+        assert exc_info.value.status == FetchStatus.PARSE_ERROR
+
+    def test_rejects_invalid_api_url(self):
+        with pytest.raises(ValueError, match="absolute HTTP or HTTPS URL"):
+            FirecrawlFetcher("localhost:3002")
 
 
 # ---------------------------------------------------------------------------

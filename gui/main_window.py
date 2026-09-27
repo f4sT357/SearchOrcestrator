@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import os
 import sys
+from threading import Thread
 from typing import Any
 
 from PySide6.QtCore import QDateTime, QUrl, Qt
@@ -44,7 +45,11 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 import json
-from gui.worker import ResearchWorker
+from gui.worker import (
+    RerankerPreloadSignals,
+    ResearchWorker,
+    preload_reranker_background,
+)
 from search_orchestrator import SearchResult, Settings, fetch_available_models
 
 
@@ -63,11 +68,33 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
 
         self._setup_ui()
-        self._load_config()
         self._apply_stylesheet()
+
+        self._reranker_preload_signals = RerankerPreloadSignals(self)
+        self._reranker_preload_signals.ready.connect(self._on_reranker_preloaded)
+        self._reranker_preload_signals.failed.connect(self._on_reranker_preload_failed)
+        self._reranker_preload_thread = Thread(
+            target=preload_reranker_background,
+            args=(self.default_settings.reranker_model, self._reranker_preload_signals),
+            name="cross-encoder-preload",
+            daemon=True,
+        )
+        self.status_label.setText("CrossEncoderをバックグラウンドで準備中...")
+        self._log("GUI起動後のバックグラウンドでCrossEncoderを読み込みます")
+        self._reranker_preload_thread.start()
 
         # Fetch models once on application startup as requested
         self._refresh_model_list(show_feedback=False)
+
+    def _on_reranker_preloaded(self) -> None:
+        self._log("CrossEncoderの準備が完了しました")
+        if self.worker is None:
+            self.status_label.setText("待機中（CrossEncoder準備完了）")
+
+    def _on_reranker_preload_failed(self, error: str) -> None:
+        self._log(f"CrossEncoderの事前読み込みに失敗しました: {error}")
+        if self.worker is None:
+            self.status_label.setText("CrossEncoderを準備できませんでした。調査開始時に再試行します")
 
     def _setup_ui(self) -> None:
         central_widget = QWidget(self)
@@ -149,25 +176,48 @@ class MainWindow(QMainWindow):
         # Numeric Options
         num_row = QHBoxLayout()
         self.concurrency_spin = QSpinBox(self)
-        self.concurrency_spin.setRange(1, 8)
-        self.concurrency_spin.setValue(2)
+        self.concurrency_spin.setRange(1, 32)
+        self.concurrency_spin.setValue(self.default_settings.max_concurrency)
         num_row.addWidget(QLabel("並列実行数:"))
         num_row.addWidget(self.concurrency_spin)
 
         self.max_queries_spin = QSpinBox(self)
-        self.max_queries_spin.setRange(1, 20)
+        self.max_queries_spin.setRange(1, 100)
         self.max_queries_spin.setValue(self.default_settings.max_search_queries)
         num_row.addWidget(QLabel("最大検索クエリ数:"))
         num_row.addWidget(self.max_queries_spin)
 
         self.max_rounds_spin = QSpinBox(self)
-        self.max_rounds_spin.setRange(1, 5)
+        self.max_rounds_spin.setRange(1, 20)
         self.max_rounds_spin.setValue(self.default_settings.max_search_rounds)
         num_row.addWidget(QLabel("最大検索ラウンド数:"))
         num_row.addWidget(self.max_rounds_spin)
         num_row.addStretch()
 
         settings_layout.addRow("実行制御:", num_row)
+
+        candidate_row = QHBoxLayout()
+        self.results_per_query_spin = QSpinBox(self)
+        self.results_per_query_spin.setRange(1, 100)
+        self.results_per_query_spin.setValue(self.default_settings.results_per_query)
+        candidate_row.addWidget(QLabel("検索取得数:"))
+        candidate_row.addWidget(self.results_per_query_spin)
+
+        self.content_candidates_spin = QSpinBox(self)
+        self.content_candidates_spin.setRange(1, 100)
+        self.content_candidates_spin.setValue(self.default_settings.content_candidate_results_per_query)
+        candidate_row.addWidget(QLabel("本文取得候補数:"))
+        candidate_row.addWidget(self.content_candidates_spin)
+
+        self.final_results_spin = QSpinBox(self)
+        self.final_results_spin.setRange(1, 100)
+        self.final_results_spin.setValue(self.default_settings.reranked_results_per_query)
+        candidate_row.addWidget(QLabel("最終採用数:"))
+        candidate_row.addWidget(self.final_results_spin)
+        candidate_row.addStretch()
+        settings_layout.addRow("検索候補数:", candidate_row)
+        self.results_per_query_spin.valueChanged.connect(self.content_candidates_spin.setMaximum)
+        self.content_candidates_spin.valueChanged.connect(self.final_results_spin.setMaximum)
 
         weights_row = QHBoxLayout()
         self.relevance_weight_spin = QDoubleSpinBox(self)
@@ -198,6 +248,11 @@ class MainWindow(QMainWindow):
         self.fetch_content_cb.setChecked(self.default_settings.fetch_web_content)
         web_row.addWidget(self.fetch_content_cb)
 
+        self.jina_fallback_cb = QCheckBox(
+            "失敗時にJina Readerを使う（URLを外部サービスへ送信）", self
+        )
+        self.jina_fallback_cb.setChecked(self.default_settings.use_fallback_fetcher)
+
         self.max_content_length_spin = QSpinBox(self)
         self.max_content_length_spin.setRange(500, 10000)
         self.max_content_length_spin.setSingleStep(500)
@@ -207,6 +262,24 @@ class MainWindow(QMainWindow):
         web_row.addStretch()
 
         settings_layout.addRow("Webアクセス:", web_row)
+        settings_layout.addRow("取得失敗時:", self.jina_fallback_cb)
+
+        self.fetcher_combo = QComboBox(self)
+        self.fetcher_combo.addItem("標準取得 (httpx / lxml)", "builtin")
+        self.fetcher_combo.addItem("Firecrawl セルフホスト", "firecrawl")
+        fetcher_index = self.fetcher_combo.findData(self.default_settings.content_fetcher)
+        if fetcher_index >= 0:
+            self.fetcher_combo.setCurrentIndex(fetcher_index)
+        settings_layout.addRow("本文取得エンジン:", self.fetcher_combo)
+
+        self.firecrawl_url_edit = QLineEdit(self.default_settings.firecrawl_api_url, self)
+        self.firecrawl_url_edit.setPlaceholderText("http://localhost:3002")
+        settings_layout.addRow("Firecrawl API URL:", self.firecrawl_url_edit)
+
+        self.firecrawl_api_key_edit = QLineEdit(self.default_settings.firecrawl_api_key, self)
+        self.firecrawl_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.firecrawl_api_key_edit.setPlaceholderText("不要なセルフホスト構成では空欄")
+        settings_layout.addRow("Firecrawl APIキー (任意):", self.firecrawl_api_key_edit)
         main_layout.addWidget(self.settings_group)
 
         # Progress / Status Bar
@@ -331,46 +404,20 @@ class MainWindow(QMainWindow):
                     f"エンドポイント ({base_url}) からモデル一覧を取得できませんでした。\nLM Studio が起動しているか確認してください。",
                 )
 
-    def _load_config(self) -> None:
-        if not os.path.exists(self.config_path):
-            return
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "model" in data:
-                self.model_combo.setCurrentText(data["model"])
-            if "base_url" in data:
-                self.base_url_edit.setText(data["base_url"])
-            if "api_key" in data:
-                self.api_key_edit.setText(data["api_key"])
-            if "max_concurrency" in data:
-                self.concurrency_spin.setValue(int(data["max_concurrency"]))
-            if "max_search_queries" in data:
-                self.max_queries_spin.setValue(int(data["max_search_queries"]))
-            if "max_search_rounds" in data:
-                self.max_rounds_spin.setValue(int(data["max_search_rounds"]))
-            if "fetch_web_content" in data:
-                self.fetch_content_cb.setChecked(bool(data["fetch_web_content"]))
-            if "max_content_length" in data:
-                self.max_content_length_spin.setValue(int(data["max_content_length"]))
-            if "relevance_weight" in data:
-                self.relevance_weight_spin.setValue(float(data["relevance_weight"]) * 100)
-            if "trust_weight" in data:
-                self.trust_weight_spin.setValue(float(data["trust_weight"]) * 100)
-            if "freshness_weight" in data:
-                self.freshness_weight_spin.setValue(float(data["freshness_weight"]) * 100)
-        except Exception:
-            pass
-
     def _save_config(self) -> None:
         data = {
             "model": self.model_combo.currentText().strip(),
             "base_url": self.base_url_edit.text().strip(),
-            "api_key": self.api_key_edit.text().strip(),
             "max_concurrency": self.concurrency_spin.value(),
             "max_search_queries": self.max_queries_spin.value(),
             "max_search_rounds": self.max_rounds_spin.value(),
+            "results_per_query": self.results_per_query_spin.value(),
+            "content_candidate_results_per_query": self.content_candidates_spin.value(),
+            "reranked_results_per_query": self.final_results_spin.value(),
             "fetch_web_content": self.fetch_content_cb.isChecked(),
+            "use_fallback_fetcher": self.jina_fallback_cb.isChecked(),
+            "content_fetcher": self.fetcher_combo.currentData(),
+            "firecrawl_api_url": self.firecrawl_url_edit.text().strip(),
             "max_content_length": self.max_content_length_spin.value(),
             "relevance_weight": self.relevance_weight_spin.value() / 100,
             "trust_weight": self.trust_weight_spin.value() / 100,
@@ -403,19 +450,30 @@ class MainWindow(QMainWindow):
 
         self._save_config()
 
+        max_concurrency = self.concurrency_spin.value()
         settings = Settings(
             model=self.model_combo.currentText().strip() or self.default_settings.model,
             base_url=self.base_url_edit.text().strip() or self.default_settings.base_url,
             api_key=self.api_key_edit.text().strip() or self.default_settings.api_key,
+            max_concurrency=max_concurrency,
             max_search_queries=self.max_queries_spin.value(),
             max_search_rounds=self.max_rounds_spin.value(),
+            results_per_query=self.results_per_query_spin.value(),
+            content_candidate_results_per_query=self.content_candidates_spin.value(),
+            reranked_results_per_query=self.final_results_spin.value(),
             fetch_web_content=self.fetch_content_cb.isChecked(),
+            use_fallback_fetcher=self.jina_fallback_cb.isChecked(),
+            content_fetcher=self.fetcher_combo.currentData(),
+            firecrawl_api_url=self.firecrawl_url_edit.text().strip() or "http://localhost:3002",
+            firecrawl_api_key=(
+                self.firecrawl_api_key_edit.text().strip()
+                or self.default_settings.firecrawl_api_key
+            ),
             max_content_length=self.max_content_length_spin.value(),
             relevance_weight=self.relevance_weight_spin.value() / 100,
             trust_weight=self.trust_weight_spin.value() / 100,
             freshness_weight=self.freshness_weight_spin.value() / 100,
         )
-        max_concurrency = self.concurrency_spin.value()
 
         # UI state during run
         self.start_btn.setEnabled(False)
