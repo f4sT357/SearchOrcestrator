@@ -69,7 +69,7 @@ python main.py --content-fetcher firecrawl --firecrawl-url "http://localhost:300
 
 ### Firecrawl セルフホストを本文取得に使う
 
-Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。
+Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。→まだ同梱していません
 
 API は `http://localhost:3002` で、この PC からだけ接続できます。GUI の詳細設定で本文取得エンジンを「Firecrawl セルフホスト」に変更し、API URL を指定します。API キーは `FIRECRAWL_API_KEY` 環境変数から読み込み、GUI の設定ファイルには保存しません。CLI では `--content-fetcher firecrawl` と `--firecrawl-url` を指定できます。
 
