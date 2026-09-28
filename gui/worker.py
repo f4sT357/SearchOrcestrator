@@ -50,6 +50,8 @@ class ResearchWorker(QThread):
     """Executes the search orchestrator workflow asynchronously."""
 
     log_signal = Signal(str)
+    board_signal = Signal(str)
+    progress_signal = Signal(str, str, str)
     result_signal = Signal(dict)
     error_signal = Signal(str)
     finished_signal = Signal()
@@ -72,7 +74,12 @@ class ResearchWorker(QThread):
             self.log_signal.emit(
                 f"ワークフローを初期化中... (モデル: {self.settings.model}, {fetch_settings})"
             )
-            workflow = create_workflow(self.settings, log=self.log_signal.emit)
+            workflow = create_workflow(
+                self.settings,
+                log=self.log_signal.emit,
+                board_update=self.board_signal.emit,
+                progress=self.progress_signal.emit,
+            )
 
             self.log_signal.emit(f"調査を開始します: 「{self.query}」")
             initial_state = {
@@ -96,9 +103,11 @@ class ResearchWorker(QThread):
                 {"max_concurrency": self.max_concurrency},
             )
 
+            self.progress_signal.emit("workflow", "completed", "")
             self.log_signal.emit("調査と回答生成が正常に完了しました。")
             self.result_signal.emit(result)
         except Exception as exc:
+            self.progress_signal.emit("workflow", "failed", str(exc))
             self.log_signal.emit(f"エラーが発生しました: {exc}")
             self.error_signal.emit(str(exc))
         finally:

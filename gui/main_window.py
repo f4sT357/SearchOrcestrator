@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -45,6 +46,7 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 import json
+from gui.workflow_view import WorkflowProgressView
 from gui.worker import (
     RerankerPreloadSignals,
     ResearchWorker,
@@ -161,28 +163,26 @@ class MainWindow(QMainWindow):
         self.model_combo.addItem(self.default_settings.model)
         self.model_combo.setCurrentText(self.default_settings.model)
         self.model_combo.setToolTip(
-            "調査計画・品質評価・レポート作成に使うLLMです。"
-            "下のBase URLで指定したAPIから利用できるモデル名を選ぶか入力してください。"
+            "調査内容を読み、検索先の案や結果のまとめを作るAIです。LM Studioで使えるモデル名を選ぶか入力してください。"
         )
         model_row.addWidget(self.model_combo, stretch=1)
 
         self.refresh_models_btn = QPushButton("🔄 AIモデル一覧を更新", self)
         self.refresh_models_btn.setObjectName("secondaryBtn")
         self.refresh_models_btn.clicked.connect(self._on_refresh_models_clicked)
-        self.refresh_models_btn.setToolTip("Base URLに接続し、利用可能なモデル名を読み直します。")
+        self.refresh_models_btn.setToolTip("AIの接続先で使えるモデル名を読み直します。")
         model_row.addWidget(self.refresh_models_btn)
 
         settings_layout.addRow("LLMモデル名:", model_row)
 
         self.base_url_edit = QLineEdit(self.default_settings.base_url, self)
         self.base_url_edit.setToolTip(
-            "LLM APIの接続先です。OpenAI互換APIのURLを入力します。"
-            "LM Studioでは通常 http://localhost:1234/v1 の形式です。"
+            "AIが動いている場所のアドレスです。LM Studioを使う場合は通常 http://localhost:1234/v1 です。"
         )
         settings_layout.addRow("Base URL (APIエンドポイント):", self.base_url_edit)
 
         self.api_key_edit = QLineEdit(self.default_settings.api_key, self)
-        self.api_key_edit.setToolTip("LLM APIの認証キーです。認証不要のローカルAPIでは既定値のままで構いません。")
+        self.api_key_edit.setToolTip("AIへの接続に必要な合言葉です。PC内のLM Studioで認証を設定していなければ、初期値のままで使えます。")
         settings_layout.addRow("APIキー:", self.api_key_edit)
 
         self.official_domains_edit = QLineEdit(
@@ -190,43 +190,41 @@ class MainWindow(QMainWindow):
         )
         self.official_domains_edit.setPlaceholderText("例: publisher.example, game.example.jp")
         self.official_domains_edit.setToolTip(
-            "公式と確認済みのドメインをカンマ区切りで登録します。URLも入力でき、"
-            "登録したドメインとそのサブドメインを一次情報として順位付けします。"
-            "検索で見つかっただけの候補は自動登録しません。"
+            "公式サイトが分かっている場合、そのサイトのアドレスをカンマ区切りで登録します。"
+            "登録したサイトを検索結果で優先します。例: example.jp, publisher.example。"
+            "検索で見つけただけのサイトは自動登録しません。"
         )
         settings_layout.addRow("登録済み公式ドメイン:", self.official_domains_edit)
 
         # Numeric Options
         num_row = QHBoxLayout()
         self.concurrency_spin = QSpinBox(self)
-        self.concurrency_spin.setRange(1, 32)
+        self.concurrency_spin.setRange(1, 8)
         self.concurrency_spin.setValue(self.default_settings.max_concurrency)
         self.concurrency_spin.setToolTip(
-            "同時に実行するWeb検索の数です。増やすと速くなる場合がありますが、"
-            "検索サービスや本文取得先への負荷も増えます。"
+            "一度に動かす検索の数です。増やすと速くなることがありますが、PCと検索サービスの負担も増えます。"
         )
-        concurrency_label = QLabel("並列実行数:")
+        concurrency_label = QLabel("同時に動かす検索数:")
         concurrency_label.setToolTip(self.concurrency_spin.toolTip())
         num_row.addWidget(concurrency_label)
         num_row.addWidget(self.concurrency_spin)
 
         self.max_queries_spin = QSpinBox(self)
-        self.max_queries_spin.setRange(1, 100)
+        self.max_queries_spin.setRange(1, 30)
         self.max_queries_spin.setValue(self.default_settings.max_search_queries)
-        self.max_queries_spin.setToolTip("初回検索と追加検索を合わせた、調査全体の検索語句数の上限です。")
-        queries_label = QLabel("最大検索クエリ数:")
+        self.max_queries_spin.setToolTip("調査全体で使う検索語の合計上限です。増やすと幅広く調べられますが、時間や通信量も増えます。通常は10〜15件が目安です。")
+        queries_label = QLabel("検索語の合計上限:")
         queries_label.setToolTip(self.max_queries_spin.toolTip())
         num_row.addWidget(queries_label)
         num_row.addWidget(self.max_queries_spin)
 
         self.max_rounds_spin = QSpinBox(self)
-        self.max_rounds_spin.setRange(1, 20)
+        self.max_rounds_spin.setRange(0, 5)
         self.max_rounds_spin.setValue(self.default_settings.max_search_rounds)
         self.max_rounds_spin.setToolTip(
-            "検索して本文を評価する追加調査の繰り返し回数の上限です。"
-            "情報不足と判断された場合に次の検索語を作ります。"
+            "最初の検索のあと、足りない情報を補う調査を繰り返す回数です。0なら追加検索をしません。通常は2回で十分です。"
         )
-        rounds_label = QLabel("最大検索ラウンド数:")
+        rounds_label = QLabel("追加調査の回数:")
         rounds_label.setToolTip(self.max_rounds_spin.toolTip())
         num_row.addWidget(rounds_label)
         num_row.addWidget(self.max_rounds_spin)
@@ -236,37 +234,34 @@ class MainWindow(QMainWindow):
 
         candidate_row = QHBoxLayout()
         self.results_per_query_spin = QSpinBox(self)
-        self.results_per_query_spin.setRange(1, 100)
+        self.results_per_query_spin.setRange(1, 20)
         self.results_per_query_spin.setValue(self.default_settings.results_per_query)
         self.results_per_query_spin.setToolTip(
-            "検索サービスから、検索語句1つにつき何件の候補を受け取るかです。"
-            "件数を増やすと、順位付け対象も増えます。"
+            "検索語1つにつき、検索サービスから受け取る候補数です。ここから本文を読む候補を選びます。通常は8件が目安です。"
         )
-        results_label = QLabel("検索取得数:")
+        results_label = QLabel("検索語ごとの候補数:")
         results_label.setToolTip(self.results_per_query_spin.toolTip())
         candidate_row.addWidget(results_label)
         candidate_row.addWidget(self.results_per_query_spin)
 
         self.content_candidates_spin = QSpinBox(self)
-        self.content_candidates_spin.setRange(1, 100)
+        self.content_candidates_spin.setRange(1, 10)
         self.content_candidates_spin.setValue(self.default_settings.content_candidate_results_per_query)
         self.content_candidates_spin.setToolTip(
-            "検索候補のうち、ページ本文を取得して品質評価にも読ませる件数です。"
-            "最終採用数より多くすると、少し順位が低い候補も本文で比較できます。"
+            "検索候補のうち、本文を開いて内容を比べる件数です。多いほど比較材料が増えますが、取得時間も長くなります。通常は3件が目安です。"
         )
-        content_candidates_label = QLabel("本文取得候補数:")
+        content_candidates_label = QLabel("本文を読む件数:")
         content_candidates_label.setToolTip(self.content_candidates_spin.toolTip())
         candidate_row.addWidget(content_candidates_label)
         candidate_row.addWidget(self.content_candidates_spin)
 
         self.final_results_spin = QSpinBox(self)
-        self.final_results_spin.setRange(1, 100)
+        self.final_results_spin.setRange(1, 6)
         self.final_results_spin.setValue(self.default_settings.reranked_results_per_query)
         self.final_results_spin.setToolTip(
-            "検索語句1つにつき、最終レポートの出典として残す件数です。"
-            "品質評価用に読む本文候補数とは別の設定です。"
+            "候補を比べたあと、検索語1つにつきレポートに残す出典数です。全体では入力上限に合わせて最大6件に整理します。通常は2件が目安です。"
         )
-        final_results_label = QLabel("最終採用数:")
+        final_results_label = QLabel("レポートに残す件数:")
         final_results_label.setToolTip(self.final_results_spin.toolTip())
         candidate_row.addWidget(final_results_label)
         candidate_row.addWidget(self.final_results_spin)
@@ -283,17 +278,17 @@ class MainWindow(QMainWindow):
             (
                 self.relevance_weight_spin,
                 self.default_settings.relevance_weight * 100,
-                "検索語句との関連度を順位に反映する割合です。",
+                "質問にどれだけ合っているかを順位に反映する割合です。上げると質問に近いページを優先します。3項目の合計を100%にしてください。",
             ),
             (
                 self.trust_weight_spin,
                 self.default_settings.trust_weight * 100,
-                "情報源の信頼度を順位に反映する割合です。未登録のサイトは中立評価になります。",
+                "サイトの信頼性を順位に反映する割合です。上げると公式サイトなどを優先します。3項目の合計を100%にしてください。",
             ),
             (
                 self.freshness_weight_spin,
                 self.default_settings.freshness_weight * 100,
-                "ページの新しさを順位に反映する割合です。更新時期が重要な調査で上げます。",
+                "ページの公開・更新時期を順位に反映する割合です。日付が見つからないページは中立に扱います。3項目の合計を100%にしてください。",
             ),
         ):
             spin.setRange(0, 100)
@@ -302,15 +297,15 @@ class MainWindow(QMainWindow):
             spin.setSuffix("%")
             spin.setValue(value)
             spin.setToolTip(description)
-        relevance_label = QLabel("関連度")
+        relevance_label = QLabel("質問との近さ")
         relevance_label.setToolTip(self.relevance_weight_spin.toolTip())
         weights_row.addWidget(relevance_label)
         weights_row.addWidget(self.relevance_weight_spin)
-        trust_label = QLabel("信頼度")
+        trust_label = QLabel("サイトの信頼性")
         trust_label.setToolTip(self.trust_weight_spin.toolTip())
         weights_row.addWidget(trust_label)
         weights_row.addWidget(self.trust_weight_spin)
-        freshness_label = QLabel("新鮮度")
+        freshness_label = QLabel("情報の新しさ")
         freshness_label.setToolTip(self.freshness_weight_spin.toolTip())
         weights_row.addWidget(freshness_label)
         weights_row.addWidget(self.freshness_weight_spin)
@@ -319,31 +314,30 @@ class MainWindow(QMainWindow):
 
         # Web Fetch Options
         web_row = QHBoxLayout()
-        self.fetch_content_cb = QCheckBox("Webページ本文を実際に取得して精読する", self)
+        self.fetch_content_cb = QCheckBox("Webページの本文も読む", self)
         self.fetch_content_cb.setChecked(self.default_settings.fetch_web_content)
         self.fetch_content_cb.setToolTip(
-            "検索結果の見出しや概要だけでなく、ページ本文も取得して品質評価とレポート作成に使います。"
+            "検索結果の見出しや短い説明だけでなく、ページを開いて本文も読みます。内容を詳しく比べられますが、調査に時間がかかります。"
         )
         web_row.addWidget(self.fetch_content_cb)
 
         self.jina_fallback_cb = QCheckBox(
-            "失敗時にJina Readerを使う（URLを外部サービスへ送信）", self
+            "取得に失敗したページを別サービスでも読む", self
         )
         self.jina_fallback_cb.setChecked(self.default_settings.use_fallback_fetcher)
         self.jina_fallback_cb.setToolTip(
-            "通常の本文取得に失敗したURLをJina Readerへ送って再取得します。"
-            "URLが外部サービスに送信されるため、必要な場合だけ有効にしてください。"
+            "通常の方法で本文を取得できないとき、別のWebサービスを使って再試行します。"
+            "ページのアドレスが外部サービスに送られるため、必要な場合だけ有効にしてください。"
         )
 
         self.max_content_length_spin = QSpinBox(self)
-        self.max_content_length_spin.setRange(500, 10000)
+        self.max_content_length_spin.setRange(500, 9000)
         self.max_content_length_spin.setSingleStep(500)
         self.max_content_length_spin.setValue(self.default_settings.max_content_length)
         self.max_content_length_spin.setToolTip(
-            "1ページから取得する本文の最大文字数です。長くすると詳細が残りますが、"
-            "LLMへ渡す文章量も増えます。全ページ合計には別途上限があります。"
+            "1ページから読む本文の上限です。長くすると詳しく読めますが、処理時間が増えます。レポートに渡す本文は全ページ合計約9,000文字までです。通常は3,000文字が目安です。"
         )
-        content_length_label = QLabel("本文最大文字数:")
+        content_length_label = QLabel("1ページの本文上限:")
         content_length_label.setToolTip(self.max_content_length_spin.toolTip())
         web_row.addWidget(content_length_label)
         web_row.addWidget(self.max_content_length_spin)
@@ -353,11 +347,11 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("取得失敗時:", self.jina_fallback_cb)
 
         self.fetcher_combo = QComboBox(self)
-        self.fetcher_combo.addItem("標準取得 (httpx / lxml)", "builtin")
-        self.fetcher_combo.addItem("Firecrawl セルフホスト", "firecrawl")
+        self.fetcher_combo.addItem("アプリから直接取得", "builtin")
+        self.fetcher_combo.addItem("Firecrawlサービスを使う", "firecrawl")
         self.fetcher_combo.setToolTip(
-            "Web本文の取得方法です。標準取得はアプリから直接ページを読み込み、"
-            "Firecrawlは指定したセルフホストAPIを使います。"
+            "Webページ本文を読み取る方法です。通常は「アプリから直接取得」を使います。"
+            "Firecrawlを使う場合は、Firecrawlサービスの接続先も設定してください。"
         )
         fetcher_index = self.fetcher_combo.findData(self.default_settings.content_fetcher)
         if fetcher_index >= 0:
@@ -366,13 +360,13 @@ class MainWindow(QMainWindow):
 
         self.firecrawl_url_edit = QLineEdit(self.default_settings.firecrawl_api_url, self)
         self.firecrawl_url_edit.setPlaceholderText("http://localhost:3002")
-        self.firecrawl_url_edit.setToolTip("Firecrawlを選んだ場合に接続するAPIのURLです。例: http://localhost:3002")
+        self.firecrawl_url_edit.setToolTip("Firecrawlサービスの接続先です。サービスを使わない場合は変更不要です。例: http://localhost:3002")
         settings_layout.addRow("Firecrawl API URL:", self.firecrawl_url_edit)
 
         self.firecrawl_api_key_edit = QLineEdit(self.default_settings.firecrawl_api_key, self)
         self.firecrawl_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.firecrawl_api_key_edit.setPlaceholderText("不要なセルフホスト構成では空欄")
-        self.firecrawl_api_key_edit.setToolTip("APIキー認証を設定したFirecrawlサーバーで使います。不要なら空欄にします。")
+        self.firecrawl_api_key_edit.setToolTip("Firecrawlサービスに接続するための合言葉です。サービス側で設定していない場合は空欄にします。")
         settings_layout.addRow("Firecrawl APIキー (任意):", self.firecrawl_api_key_edit)
         main_layout.addWidget(self.settings_group)
 
@@ -390,7 +384,7 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.progress_bar)
         main_layout.addLayout(status_layout)
 
-        # Tabs for Results, Sources, and Logs
+        # Tabs for Results, Sources, the live research board, and Logs
         self.tabs = QTabWidget(self)
 
         # Tab 1: Summary Report
@@ -441,7 +435,31 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(sources_tab, "🔗 参照ソース一覧")
 
-        # Tab 3: Execution Logs
+        # Tab 3: Live workflow diagram
+        workflow_tab = QWidget()
+        workflow_layout = QVBoxLayout(workflow_tab)
+        workflow_layout.setContentsMargins(8, 8, 8, 8)
+        workflow_scroll = QScrollArea(workflow_tab)
+        workflow_scroll.setWidgetResizable(True)
+        workflow_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workflow_view = WorkflowProgressView()
+        workflow_scroll.setWidget(self.workflow_view)
+        workflow_layout.addWidget(workflow_scroll)
+        self.tabs.addTab(workflow_tab, "🔄 調査の進行状況")
+
+        # Tab 4: Live shared board
+        board_tab = QWidget()
+        board_layout = QVBoxLayout(board_tab)
+        board_layout.setContentsMargins(8, 8, 8, 8)
+        self.board_edit = QPlainTextEdit(self)
+        self.board_edit.setReadOnly(True)
+        self.board_edit.setPlaceholderText(
+            "調査中に確認できた事実・未確認点・矛盾や訂正が、投稿形式でここに追加されます。"
+        )
+        board_layout.addWidget(self.board_edit)
+        self.tabs.addTab(board_tab, "📌 調査ボード")
+
+        # Tab 5: Execution Logs
         log_tab = QWidget()
         log_layout = QVBoxLayout(log_tab)
         log_layout.setContentsMargins(8, 8, 8, 8)
@@ -582,7 +600,9 @@ class MainWindow(QMainWindow):
         self.start_btn.setText("⏳ 調査中...")
         self.status_label.setText("調査を実行しています...")
         self.progress_bar.setRange(0, 0)  # Marquee/busy mode
-        self.tabs.setCurrentIndex(2)  # Switch to log tab during execution
+        self.board_edit.clear()
+        self.workflow_view.begin_run()
+        self.tabs.setCurrentIndex(2)  # Keep the live workflow visible during execution
 
         self._log(f"調査を開始します: 「{query}」")
 
@@ -594,6 +614,8 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.worker.log_signal.connect(self._log)
+        self.worker.board_signal.connect(self._update_board)
+        self.worker.progress_signal.connect(self.workflow_view.update_progress)
         self.worker.result_signal.connect(self._on_result_received)
         self.worker.error_signal.connect(self._on_error_received)
         self.worker.finished_signal.connect(self._on_worker_finished)
@@ -640,6 +662,11 @@ class MainWindow(QMainWindow):
     def _log(self, message: str) -> None:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{timestamp}] {message}")
+
+    def _update_board(self, board: str) -> None:
+        self.board_edit.setPlainText(board)
+        scrollbar = self.board_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _on_source_cell_clicked(self, row: int, column: int) -> None:
         url_item = self.sources_table.item(row, 5)

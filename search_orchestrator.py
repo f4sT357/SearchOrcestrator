@@ -76,9 +76,9 @@ class Settings:
     # The multilingual reranker is CPU-intensive. These conservative defaults
     # keep an interactive run responsive while retaining multiple sources.
     max_concurrency: int = 2
-    max_search_queries: int = 6
+    max_search_queries: int = 13
     max_search_rounds: int = 2
-    results_per_query: int = 5
+    results_per_query: int = 8
     reranked_results_per_query: int = 2
     content_candidate_results_per_query: int = 3
     relevance_weight: float = 0.50
@@ -196,7 +196,7 @@ class Evaluation(BaseModel):
     weak_evidence: list[str]
     reason: str
     additional_queries: list[str]
-    run_memo: str = ""
+
 
 
 class SearchResult(BaseModel):
@@ -959,6 +959,37 @@ def normalize_evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def append_run_memo_posts(
+    board: str,
+    updates: list[str],
+    *,
+    max_chars: int = 5000,
+) -> tuple[str, list[str], int]:
+    """Append distinct bulletin-board posts, evicting oldest whole posts at capacity."""
+    entries = [line.strip() for line in board.splitlines() if line.strip()]
+    known = {" ".join(entry.lstrip("-• ").split()).casefold() for entry in entries}
+    added: list[str] = []
+    for update in updates:
+        body = " ".join(update.split()).strip()
+        if not body:
+            continue
+        normalized = body.lstrip("-• ").casefold()
+        if normalized in known:
+            continue
+        entry = body if body.startswith(("- ", "• ")) else f"- {body}"
+        if len(entry) > max_chars:
+            entry = entry[:max_chars - 1] + "…"
+        entries.append(entry)
+        added.append(entry)
+        known.add(normalized)
+
+    evicted = 0
+    while entries and len("\n".join(entries)) > max_chars:
+        entries.pop(0)
+        evicted += 1
+    return "\n".join(entries), added, evicted
+
+
 def strip_model_reasoning(text: str) -> str:
     """Remove visible reasoning sections before model text reaches user output."""
     if not isinstance(text, str):
@@ -1003,6 +1034,8 @@ def create_workflow(
     fetcher: WebContentFetcher | None = None,
     fallback_fetcher: WebContentFetcher | None = None,
     log: Callable[[str], None] | None = None,
+    board_update: Callable[[str], None] | None = None,
+    progress: Callable[[str, str, str], None] | None = None,
 ) -> Any:
     """Build the graph and initialize its dependencies."""
     if llm is None:
@@ -1012,6 +1045,26 @@ def create_workflow(
             api_key=settings.api_key,
             temperature=0,
         )
+    board_writer_llm = llm.bind_tools([
+        {
+            "type": "function",
+            "function": {
+                "name": "write_research_board",
+                "description": "必ず1回呼ぶ。新しい投稿が不要ならcontentを英小文字のnothingにする。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "掲示板に残す短い投稿。投稿不要の場合は正確にnothing。",
+                        }
+                    },
+                    "required": ["content"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ], tool_choice="required")
     if search is None:
         search = DDGS()
     if reranker is None:
@@ -1036,6 +1089,38 @@ def create_workflow(
     def log_detail(message: str) -> None:
         if log is not None:
             log(message)
+
+    def report_progress(stage: str, status: str, detail: str = "") -> None:
+        if progress is not None:
+            try:
+                progress(stage, status, detail)
+            except Exception as error:
+                log_detail(f"進行状況の通知に失敗しました: {error}")
+
+    def track_node(stage: str, node: Callable[[State], dict[str, Any]]):
+        def tracked(state: State):
+            detail = ""
+            if stage == "search":
+                task = state.get("task")
+                detail = task.query if task else "通常検索"
+            elif stage == "official_search":
+                detail = f"{len(state.get('official_queries', []))}件の公式検索"
+            elif stage == "additional_search":
+                evaluation = state.get("evaluation")
+                detail = f"検索ラウンド {state.get('search_round', 0) + 1}"
+                if evaluation and evaluation.additional_queries:
+                    detail += f" / {evaluation.additional_queries[0]}"
+            elif stage == "evaluate":
+                detail = f"検索 {state.get('search_round', 0) + 1}回目の結果"
+            report_progress(stage, "started", detail)
+            try:
+                result = node(state)
+            except Exception as error:
+                report_progress(stage, "failed", str(error))
+                raise
+            report_progress(stage, "completed", detail)
+            return result
+        return tracked
 
     def log_selected_results(results: list[SearchResult], label: str = "採用候補") -> None:
         for index, item in enumerate(results, start=1):
@@ -1091,6 +1176,13 @@ def create_workflow(
             if not plan.tasks:
                 plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
             log_detail(f"調査計画: {len(plan.tasks)}件の観点を作成")
+            log_detail("生成された調査計画の内容:")
+            for index, task in enumerate(plan.tasks, start=1):
+                log_detail(
+                    f"  計画候補 {index}: {task.aspect} / クエリ: {task.query} / 理由: {task.reason}"
+                )
+            for index, query in enumerate(plan.official_queries, start=1):
+                log_detail(f"  公式検索案 {index}: {query}")
         except Exception as err:
             print(f"調査計画のパース失敗 (フォールバック適用): {err}")
             plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
@@ -1103,6 +1195,11 @@ def create_workflow(
         except Exception as error:
             validated_queries = []
             log_detail(f"調査計画の関連度検査に失敗しました。元の質問から検索します: {error}")
+        log_detail(
+            f"関連度検査を通過した調査計画クエリ: {len(validated_queries)}/{len(plan.tasks)}件"
+        )
+        for index, query in enumerate(validated_queries, start=1):
+            log_detail(f"  採用クエリ {index}: {query}")
         if len(validated_queries) != len(plan.tasks):
             log_detail(
                 f"元の質問との関連が弱い調査計画を {len(plan.tasks) - len(validated_queries)}件除外しました"
@@ -1332,7 +1429,7 @@ def create_workflow(
         prompt = f"""あなたはリサーチ品質評価担当です。現在日: {current_date}
 質問: {state['query']}
 調査計画: {state['plan']}
-この調査回だけの作業メモ（前回までの暫定整理。根拠本文と矛盾すれば本文を優先）:
+この調査回だけの共有ボード（これまでの投稿。根拠本文と矛盾すれば本文を優先）:
 {state.get('run_memo', '') or '（まだありません）'}
 関連度スコア {MIN_RELEVANCE_FOR_EVALUATION:.2f} 以上の検索結果およびWebページ本文（これ以外の検索結果は評価から除外済み）:
 {formatted_evidence}
@@ -1361,7 +1458,7 @@ source区分が other、または信頼度が中立値であることだけで�
 6. **「other」や信頼性を判断できないソース1件だけに依拠する主張は weak_evidence とする。高品質で独立した複数の二次情報が一致していれば、二次情報のみでも十分と判定してよい。**
 7. **新鮮度スコアが低い情報や、ページ間の矛盾・未確認事項を指摘する。**
 8. **追加検索が有効な不足だけ additional_queries に入れる。一次情報の所在を確かめる検索に加え、裏付けが不足する場合は独立した専門二次情報も探すクエリを提案する。**
-9. run_memo に、次の検索や回答作成に必要な暫定整理を日本語で最大5000文字にまとめる。確認できた事実の要点、未確認点、ソース間の矛盾や古さを残し、根拠のない推測を入れない。これはこの調査実行中だけのメモで、最終回答の根拠にはせず、必ず下の本文と出典で再確認する。
+9. 共有ボードは既存投稿と根拠を確認する索引として参照してください。新規投稿の判断と書き込みは後続の専用ノードが行います。
 10. sufficiency は元の質問に対する回答可能性で判定する。質問されていない性能・育成・ガチャ詳細が未確認でも、それだけを理由に不足とはしない。
 
 検索クエリとURLを見て、ソースが独立しているか慎重に判断してください。異なるURLだけでは独立した根拠とは言えません。一次情報がなくても、独立した高品質な二次情報が十分に裏付けるなら sufficient を true にできます。その場合、reason に一次情報を確認できなかった事情と二次情報を採用した理由を簡潔に記してください。
@@ -1375,7 +1472,6 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
   "weak_evidence": ["根拠が弱い点1（独立確認のない情報源、矛盾など）"],
   "reason": "評価理由",
   "additional_queries": ["対象名 不足項目 公式", "対象名 別の不足項目"],
-  "run_memo": "次の検索や回答に必要な暫定整理。最大5000文字"
 }}
 ```
 
@@ -1395,14 +1491,14 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
                     raise RuntimeError("品質評価モデルから応答を取得できませんでした")
                 repair_prompt = f'''次の品質評価案を、指定形式の有効なJSONに修正してください。
 評価案の内容を保ち、値を推測で追加しないでください。JSON以外は出力しないでください。
-必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[]), run_memo (string)
+必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[])
 additional_queries の各要素は検索文そのものの文字列です。{{"query": "..."}} のようなオブジェクトを配列に入れないでください。
 
 評価案:
 {raw_evaluation}
 
 JSON例:
-{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"run_memo":"この調査回だけの暫定メモ"}}'''
+{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[]}}'''
                 repaired = llm.invoke(repair_prompt)
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
@@ -1475,11 +1571,75 @@ JSON例:
             log_detail(f"  根拠が弱い点: {weak}")
         for query in eval_obj.additional_queries:
             log_detail(f"  追加検索案: {query}")
-        memo = (eval_obj.run_memo or state.get("run_memo", ""))[:5000]
-        if memo and memo != state.get("run_memo", ""):
-            log_detail("今回の調査中だけ使う作業メモを更新しました")
-        return {"evaluation": eval_obj, "run_memo": memo}
+        return {"evaluation": eval_obj}
 
+    def update_board(state: State):
+        evaluation = state.get("evaluation")
+        all_results = deduplicate_results(
+            (state.get("evidence_results", []) or state.get("results", []))
+            + state.get("official_results", [])
+        )
+        board_sources = _evaluation_sources(
+            all_results, official_candidates=state.get("official_results", []),
+        )
+        evidence = format_results_for_llm(board_sources) if board_sources else "今回の調査では根拠ソースがありません。"
+        prompt = f"""あなたは今回の調査専用ボードの記録担当です。
+検索で新しく分かった内容を、次の検索や回答作成で再利用できる場合だけ掲示板へ記録します。
+
+必ず write_research_board tool を1回呼び出してください。書き込む価値のある新情報がなければ、content に英小文字で正確に nothing と指定してください。nothing はアプリ側で破棄し、掲示板に保存しません。
+投稿は1件にまとめ、確認済み事実・未確認点・矛盾・訂正を明示し、可能なら出典名またはURLと日付を添えてください。既存投稿との重複、根拠のない推測、本文根拠と矛盾する断定は投稿しないでください。
+
+質問: {state['query']}
+調査計画: {state.get('plan')}
+既存ボード:
+{state.get('run_memo', '') or '（まだ投稿はありません）'}
+今回の品質評価:
+{evaluation}
+今回までの根拠ソース:
+{evidence}
+"""
+        try:
+            response = board_writer_llm.invoke(prompt)
+        except Exception as error:
+            log_detail(f"掲示板tool callに失敗しました: {error}")
+            return {}
+
+        calls = getattr(response, "tool_calls", None) or []
+        if len(calls) != 1:
+            log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
+            return {}
+        call = calls[0]
+        if call.get("name") != "write_research_board":
+            log_detail(f"想定外の掲示板tool callです: {call.get('name')}")
+            return {}
+        arguments = call.get("args") or {}
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("content"), str):
+            log_detail("掲示板tool callのcontentが不正です。今回は書き込みません")
+            return {}
+        post = arguments["content"].strip()
+        log_detail("掲示板tool call: write_research_board")
+        if post.casefold() == "nothing":
+            log_detail("掲示板tool call: nothing（追記不要のため破棄）")
+            return {}
+        if not post:
+            log_detail("掲示板tool callが空投稿だったため破棄しました")
+            return {}
+
+        memo, added_posts, evicted_posts = append_run_memo_posts(
+            state.get("run_memo", ""), [post], max_chars=5000,
+        )
+        if added_posts:
+            log_detail(f"共有ボードに新規投稿 {len(added_posts)}件:")
+            for item in added_posts:
+                log_detail(f"  {item}")
+        else:
+            log_detail("重複投稿を破棄しました")
+        if evicted_posts:
+            log_detail(f"共有ボードが5000文字上限に達したため、古い投稿を {evicted_posts}件整理しました")
+        if board_update is not None and (added_posts or evicted_posts):
+            board_update(memo)
+            return {"run_memo": memo}
+        return {}
     def should_continue(state: State):
         evaluation = state.get("evaluation")
         if evaluation is None or evaluation.sufficient:
@@ -1625,7 +1785,7 @@ JSON例:
 現在日（この調査の基準日）: {current_date}
 質問: {state['query']}
 
-この調査回だけの作業メモ（索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
+この調査回だけの共有ボード（過去の投稿を含む索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
 {run_memo}
 
 収集された情報源:
@@ -1670,17 +1830,19 @@ JSON例:
         return {"summary": render_verified_sources(answer, unique_results)}
 
     builder = StateGraph(State)
-    builder.add_node("planner", planner)
-    builder.add_node("search", search_task)
-    builder.add_node("official_search", official_search)
-    builder.add_node("evaluate", evaluate)
-    builder.add_node("additional_search", additional_search)
-    builder.add_node("analyze", analyze)
+    builder.add_node("planner", track_node("planner", planner))
+    builder.add_node("search", track_node("search", search_task))
+    builder.add_node("official_search", track_node("official_search", official_search))
+    builder.add_node("evaluate", track_node("evaluate", evaluate))
+    builder.add_node("board_update", track_node("board_update", update_board))
+    builder.add_node("additional_search", track_node("additional_search", additional_search))
+    builder.add_node("analyze", track_node("analyze", analyze))
     builder.add_edge(START, "planner")
     builder.add_conditional_edges("planner", dispatch_searches)
     builder.add_edge("search", "evaluate")
     builder.add_edge("official_search", "evaluate")
-    builder.add_conditional_edges("evaluate", should_continue, {
+    builder.add_edge("evaluate", "board_update")
+    builder.add_conditional_edges("board_update", should_continue, {
         "analyze": "analyze", "additional_search": "additional_search",
     })
     builder.add_edge("additional_search", "evaluate")

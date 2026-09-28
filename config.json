@@ -1,18 +1,19 @@
 {
   "model": "qwen3.5-4b-claude-opus-reasoning-distill-i1",
   "base_url": "http://localhost:1234/v1",
-  "max_concurrency": 20,
-  "max_search_queries": 15,
-  "max_search_rounds": 10,
-  "results_per_query": 5,
+  "max_concurrency": 2,
+  "max_search_queries": 13,
+  "max_search_rounds": 2,
+  "results_per_query": 8,
   "content_candidate_results_per_query": 3,
   "reranked_results_per_query": 2,
   "fetch_web_content": true,
   "use_fallback_fetcher": false,
   "content_fetcher": "firecrawl",
   "firecrawl_api_url": "http://localhost:3002",
-  "max_content_length": 9999,
+  "max_content_length": 3000,
   "relevance_weight": 0.5,
   "trust_weight": 0.3,
-  "freshness_weight": 0.2
+  "freshness_weight": 0.2,
+  "official_domains": []
 }
