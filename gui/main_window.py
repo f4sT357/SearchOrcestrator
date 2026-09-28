@@ -50,7 +50,9 @@ from gui.worker import (
     ResearchWorker,
     preload_reranker_background,
 )
-from search_orchestrator import SearchResult, Settings, fetch_available_models
+from search_orchestrator import (
+    SearchResult, Settings, fetch_available_models, normalize_official_domains,
+)
 
 
 class MainWindow(QMainWindow):
@@ -182,6 +184,17 @@ class MainWindow(QMainWindow):
         self.api_key_edit = QLineEdit(self.default_settings.api_key, self)
         self.api_key_edit.setToolTip("LLM APIの認証キーです。認証不要のローカルAPIでは既定値のままで構いません。")
         settings_layout.addRow("APIキー:", self.api_key_edit)
+
+        self.official_domains_edit = QLineEdit(
+            ", ".join(self.default_settings.official_domains), self,
+        )
+        self.official_domains_edit.setPlaceholderText("例: publisher.example, game.example.jp")
+        self.official_domains_edit.setToolTip(
+            "公式と確認済みのドメインをカンマ区切りで登録します。URLも入力でき、"
+            "登録したドメインとそのサブドメインを一次情報として順位付けします。"
+            "検索で見つかっただけの候補は自動登録しません。"
+        )
+        settings_layout.addRow("登録済み公式ドメイン:", self.official_domains_edit)
 
         # Numeric Options
         num_row = QHBoxLayout()
@@ -503,6 +516,7 @@ class MainWindow(QMainWindow):
             "relevance_weight": self.relevance_weight_spin.value() / 100,
             "trust_weight": self.trust_weight_spin.value() / 100,
             "freshness_weight": self.freshness_weight_spin.value() / 100,
+            "official_domains": list(normalize_official_domains(self.official_domains_edit.text())),
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -527,6 +541,12 @@ class MainWindow(QMainWindow):
         )
         if weight_total != 100:
             QMessageBox.warning(self, "設定エラー", "ソース順位の重みの合計を100%にしてください。")
+            return
+
+        try:
+            official_domains = normalize_official_domains(self.official_domains_edit.text())
+        except ValueError as error:
+            QMessageBox.warning(self, "設定エラー", str(error))
             return
 
         self._save_config()
@@ -554,6 +574,7 @@ class MainWindow(QMainWindow):
             relevance_weight=self.relevance_weight_spin.value() / 100,
             trust_weight=self.trust_weight_spin.value() / 100,
             freshness_weight=self.freshness_weight_spin.value() / 100,
+            official_domains=official_domains,
         )
 
         # UI state during run

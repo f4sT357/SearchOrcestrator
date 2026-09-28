@@ -29,6 +29,7 @@ from source_scoring import (
     domain_trust_score,
     extract_content_date,
     freshness_score,
+    normalize_official_domains,
     source_tier,
 )
 
@@ -92,8 +93,10 @@ class Settings:
     # Fallback fetcher configuration
     use_fallback_fetcher: bool = False
     jina_api_url: str = "https://r.jina.ai/"
+    official_domains: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "official_domains", normalize_official_domains(self.official_domains))
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         if self.max_search_queries < 1 or self.max_search_rounds < 0:
@@ -140,6 +143,8 @@ class Settings:
         ):
             if env_name in os.environ:
                 values[key] = float(os.environ[env_name])
+        if "SEARCH_OFFICIAL_DOMAINS" in os.environ:
+            values["official_domains"] = os.environ["SEARCH_OFFICIAL_DOMAINS"]
         return cls(**values)
 
 
@@ -182,6 +187,7 @@ class SearchTask(BaseModel):
 
 class SearchPlan(BaseModel):
     tasks: list[SearchTask]
+    official_queries: list[str] = Field(default_factory=list)
 
 
 class Evaluation(BaseModel):
@@ -190,6 +196,7 @@ class Evaluation(BaseModel):
     weak_evidence: list[str]
     reason: str
     additional_queries: list[str]
+    run_memo: str = ""
 
 
 class SearchResult(BaseModel):
@@ -233,7 +240,9 @@ class State(TypedDict):
     task: SearchTask | None
     results: Annotated[list[SearchResult], operator.add]
     evidence_results: Annotated[list[SearchResult], operator.add]
+    official_results: Annotated[list[SearchResult], operator.add]
     evaluation: Evaluation | None
+    run_memo: str
     summary: str
     search_query_count: Annotated[int, operator.add]
     search_round: Annotated[int, operator.add]
@@ -309,14 +318,36 @@ _QUERY_STOP_TERMS = {
 }
 
 
-def _evaluation_sources(results: list[SearchResult]) -> list[SearchResult]:
+def _evaluation_sources(
+    results: list[SearchResult],
+    *,
+    official_candidates: list[SearchResult] | None = None,
+) -> list[SearchResult]:
     relevant = [
         item for item in deduplicate_results(results)
         if item.relevance_score is not None
         and item.relevance_score >= MIN_RELEVANCE_FOR_EVALUATION
     ]
     ranked = sorted(relevant, key=lambda item: item.combined_score or 0.0, reverse=True)
-    return select_diverse_results(ranked, MAX_EVIDENCE_SOURCES)
+    # Keep room for relevant primary evidence and results from the dedicated
+    # official-search lane so a large pile of secondary results cannot crowd
+    # every official candidate out of the evaluator context.
+    official_urls = {
+        item.url for item in (official_candidates or [])
+        if item.url and item.relevance_score is not None and item.relevance_score >= 0.45
+    }
+    primary = [
+        item for item in ranked
+        if item.source_reliability == "primary" or item.url in official_urls
+    ]
+    primary_slots = min(3, MAX_EVIDENCE_SOURCES)
+    selected_primary = select_diverse_results(primary, primary_slots)
+    selected_urls = {item.url for item in selected_primary}
+    remaining = [item for item in ranked if item.url not in selected_urls]
+    selected_secondary = select_diverse_results(
+        remaining, max(0, MAX_EVIDENCE_SOURCES - len(selected_primary)),
+    )
+    return selected_primary + selected_secondary
 
 
 def _query_anchor_terms(query: str) -> set[str]:
@@ -683,6 +714,7 @@ def rerank_results(
     top_k: int,
     *,
     weights: tuple[float, float, float] = (0.50, 0.30, 0.20),
+    official_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
     valid_results = [item for item in results if item.url]
     if not valid_results:
@@ -693,12 +725,13 @@ def rerank_results(
     enriched: list[SearchResult] = []
     for item, rel_score in zip(valid_results, raw_scores, strict=True):
         rel = float(rel_score)
-        tier = source_tier(item.url)
-        trust = domain_trust_score(item.url)
+        tier = source_tier(item.url, official_domains)
+        trust = domain_trust_score(item.url, official_domains)
         fresh = freshness_score(item.url)
         comb = composite_score(
             rel, item.url,
             w_relevance=weights[0], w_trust=weights[1], w_freshness=weights[2],
+            official_domains=official_domains,
         )
         enriched.append(item.model_copy(update={
             "relevance_score": rel,
@@ -736,6 +769,7 @@ def populate_content(
     max_length: int = 3000,
     fallback_fetcher: WebContentFetcher | None = None,
     weights: tuple[float, float, float] = (0.50, 0.30, 0.20),
+    official_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
     """Fetch web content for each result, falling back to Jina Reader on failure."""
     if not fetcher:
@@ -782,6 +816,7 @@ def populate_content(
         combined = composite_score(
             item.relevance_score, item.url, content=item.content,
             w_relevance=weights[0], w_trust=weights[1], w_freshness=weights[2],
+            official_domains=official_domains,
         )
         rescored.append(item.model_copy(update={
             "page_date": page_date.isoformat() if page_date else None,
@@ -1026,7 +1061,11 @@ def create_workflow(
         prompt = f"""あなたはリサーチプランナーです。現在日: {current_date}
 質問: {state['query']}
 
-重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。内部の思考過程は出力せず、以下のJSON形式のみを出力してください。<think>タグ、分析文、JSON以外の前置きは禁止です。
+重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。
+
+通常の調査計画とは別に、運営元・公式サイト・公式告知・公式文書を探すための official_queries を最大5件作ってください。検索語や検索先を少しずつ変え、公式発表・お知らせ・更新履歴・公式SNSや配信ページなど、質問に合う一次情報の入口を複数探します。検索語には「公式」「告知」「お知らせ」「公式サイト」などを含めます。対象が特定できない site: ドメインを推測して付けないでください。このレーンは一次情報を探す専用であり、見つかったページが本当に公式かは後で本文と発行元を確認します。
+
+内部の思考過程は出力せず、以下のJSON形式のみを出力してください。<think>タグ、分析文、JSON以外の前置きは禁止です。
 
 ```json
 {{
@@ -1041,7 +1080,8 @@ def create_workflow(
       "query": "対象名 別の観点 キーワード",
       "reason": "検索する理由2"
     }}
-  ]
+  ],
+  "official_queries": ["対象名 公式 発表", "対象名 公式 お知らせ", "対象名 公式サイト 最新情報", "対象名 公式 更新履歴", "対象名 公式 配信"]
 }}
 ```"""
         try:
@@ -1067,6 +1107,32 @@ def create_workflow(
             log_detail(
                 f"元の質問との関連が弱い調査計画を {len(plan.tasks) - len(validated_queries)}件除外しました"
             )
+        official_queries = [
+            re.sub(r"\s+", " ", item).strip()
+            for item in plan.official_queries
+            if item.strip() and len(item.strip()) <= 300
+        ][:5]
+        official_queries = list(dict.fromkeys(official_queries))
+        try:
+            official_queries = _validate_followup_queries(
+                state["query"], official_queries, reranker,
+            )
+        except Exception as error:
+            log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {error}")
+            official_queries = []
+        subject = _compact_query_terms(state["query"]) or state["query"].strip()
+        official_fallbacks = [
+            f"{subject} 公式 発表",
+            f"{subject} 公式 お知らせ",
+            f"{subject} 公式サイト 最新情報",
+            f"{subject} 公式 更新履歴",
+            f"{subject} 公式 配信",
+        ]
+        for fallback_query in official_fallbacks:
+            if len(official_queries) >= 5:
+                break
+            if fallback_query.casefold() not in {query.casefold() for query in official_queries}:
+                official_queries.append(fallback_query)
         plan = SearchPlan(tasks=[
             SearchTask(
                 aspect="質問に関する調査",
@@ -1074,7 +1140,7 @@ def create_workflow(
                 reason="元の質問に関連する情報を確認するため",
             )
             for query in validated_queries
-        ])
+        ], official_queries=official_queries)
         if not plan.tasks:
             plan = SearchPlan(tasks=[
                 SearchTask(
@@ -1082,18 +1148,102 @@ def create_workflow(
                     query=state["query"],
                     reason="元の質問に直接答えるための基本情報収集",
                 )
-            ])
+            ], official_queries=official_queries)
             log_detail("有効な調査計画が残らなかったため、元の質問だけで検索します")
         for index, task in enumerate(plan.tasks, start=1):
             log_detail(f"  計画 {index}: {task.aspect} / クエリ: {task.query} / 理由: {task.reason}")
-        if len(plan.tasks) > settings.max_search_queries:
-            log_detail(f"検索クエリ上限により、計画の先頭 {settings.max_search_queries} 件を実行します")
+        official_limit = min(5, max(settings.max_search_queries - 1, 0))
+        regular_limit = settings.max_search_queries - official_limit if official_limit else settings.max_search_queries
+        if len(plan.tasks) > regular_limit:
+            log_detail(
+                f"通常検索 {regular_limit}件と公式検索 {official_limit}件の枠を確保します"
+            )
         return {"plan": plan}
 
     def dispatch_searches(state: State):
         if state["plan"] is None:
             return []
-        return [Send("search", {"task": task}) for task in state["plan"].tasks[:settings.max_search_queries]]
+        # Reserve up to five initial query slots for the independent official-source lane.
+        official_limit = min(5, max(settings.max_search_queries - 1, 0))
+        selected_official_queries = state["plan"].official_queries[:official_limit]
+        regular_limit = settings.max_search_queries - len(selected_official_queries)
+        if not selected_official_queries:
+            regular_limit = settings.max_search_queries
+        sends = [
+            Send("search", {"task": task})
+            for task in state["plan"].tasks[:regular_limit]
+        ]
+        if selected_official_queries:
+            sends.append(Send("official_search", {
+                "query": state["query"],
+                "official_queries": selected_official_queries,
+            }))
+        else:
+            log_detail("検索クエリ上限のため、公式ソース専用検索を見送りました")
+        return sends
+
+    def official_search(state: State):
+        """Search independent queries dedicated to finding first-party sources."""
+        queries = state.get("official_queries", [])[:5]
+        if not queries:
+            return {
+                "results": [], "evidence_results": [], "official_results": [],
+                "search_query_count": 0, "searched_queries": [],
+            }
+        log_detail(f"公式ソース専用検索を開始します（最大 {len(queries)} クエリ）")
+        evidence_results: list[SearchResult] = []
+        selected_results: list[SearchResult] = []
+        searched_queries: list[str] = []
+        weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
+        candidate_count = (
+            settings.content_candidate_results_per_query
+            if fetcher else settings.reranked_results_per_query
+        )
+        for query in queries:
+            log_detail(f"公式ソース専用検索: {query}")
+            searched_queries.append(query)
+            candidates: list[SearchResult] = []
+            try:
+                response = search.text(query, max_results=settings.results_per_query)
+                add_search_results(candidates, response, query)
+                log_detail(f"公式ソース検索候補: {len(candidates)}件")
+            except Exception as error:
+                if "no results found" in str(error).casefold():
+                    log_detail(f"公式ソース検索結果なし: {query}")
+                else:
+                    log_detail(f"公式ソース検索に失敗しました: {query} / {error}")
+                continue
+            query_candidates = rerank_results(
+                candidates, reranker, candidate_count, weights=weights,
+                official_domains=settings.official_domains,
+            )
+            if fetcher:
+                query_candidates = populate_content(
+                    query_candidates, fetcher, timeout=settings.fetch_timeout,
+                    max_length=settings.max_content_length,
+                    fallback_fetcher=fallback_fetcher, weights=weights,
+                    official_domains=settings.official_domains,
+                )
+            evidence_results.extend(query_candidates)
+            selected_results.extend(
+                select_diverse_results(query_candidates, settings.reranked_results_per_query)
+            )
+        evidence_results = deduplicate_results(evidence_results)
+        selected = select_diverse_results(
+            deduplicate_results(selected_results),
+            settings.reranked_results_per_query * len(queries),
+        )
+        log_selected_results(selected, label="公式ソース専用検索候補")
+        if not selected:
+            log_detail("公式ソース専用検索で採用できる候補はありませんでした")
+        log_detail(f"公式ソース本文候補 {len(evidence_results)}件を品質評価へ渡します")
+        return {
+            "results": selected,
+            "evidence_results": evidence_results,
+            "official_results": evidence_results,
+            "search_query_count": len(searched_queries),
+            "searched_queries": searched_queries,
+        }
 
     def search_task(state: State):
         task = state.get("task")
@@ -1122,7 +1272,10 @@ def create_workflow(
             if fetcher else settings.reranked_results_per_query
         )
         scoring_weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
-        top_results = rerank_results(fresh_results, reranker, candidate_count, weights=scoring_weights)
+        top_results = rerank_results(
+            fresh_results, reranker, candidate_count, weights=scoring_weights,
+            official_domains=settings.official_domains,
+        )
         log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
         if fetcher:
             top_results = populate_content(
@@ -1132,6 +1285,7 @@ def create_workflow(
                 max_length=settings.max_content_length,
                 fallback_fetcher=fallback_fetcher,
                 weights=scoring_weights,
+                official_domains=settings.official_domains,
             )
         evidence_results = top_results
         log_detail(f"品質評価用に本文候補 {len(evidence_results)}件を保持します")
@@ -1148,9 +1302,12 @@ def create_workflow(
 
     def evaluate(state: State):
         all_results = deduplicate_results(
-            state.get("evidence_results", []) or state.get("results", [])
+            (state.get("evidence_results", []) or state.get("results", []))
+            + state.get("official_results", [])
         )
-        unique_results = _evaluation_sources(all_results)
+        unique_results = _evaluation_sources(
+            all_results, official_candidates=state.get("official_results", []),
+        )
         relevance_eligible = [
             item for item in all_results
             if item.relevance_score is not None
@@ -1175,8 +1332,17 @@ def create_workflow(
         prompt = f"""あなたはリサーチ品質評価担当です。現在日: {current_date}
 質問: {state['query']}
 調査計画: {state['plan']}
+この調査回だけの作業メモ（前回までの暫定整理。根拠本文と矛盾すれば本文を優先）:
+{state.get('run_memo', '') or '（まだありません）'}
 関連度スコア {MIN_RELEVANCE_FOR_EVALUATION:.2f} 以上の検索結果およびWebページ本文（これ以外の検索結果は評価から除外済み）:
 {formatted_evidence}
+
+公式ソース専用レーンで取得した候補:
+{format_results_for_llm(_evaluation_sources(
+    state.get('official_results', []), official_candidates=state.get('official_results', [])
+)) if state.get('official_results') else '候補なし'}
+
+評価範囲: 元の質問に答えるのに必要な情報だけを不足扱いしてください。広い「新キャラを調べて」のような依頼では、名前・公式発表かリークか・実装状況や日程の確認を中心にし、性能、育成、ガチャ確率、星声計算など依頼されていない詳細は必須条件にしないでください。
 
 追加検索案は質問・調査計画と上記の関連性が確認された情報源だけから作成してください。上記に含まれない情報源の内容や話題は推測・補完しないでください。関連度を満たす情報源がない場合は、質問と調査計画に直接沿った一般的な確認クエリだけを提案してください。
 
@@ -1188,12 +1354,15 @@ additional_queries は検索エンジン向けの短いキーワード列にし�
 source区分が other、または信頼度が中立値であることだけで本文を捨てないでください。明らかなスパム、対象と無関係なページ、本文のないページを除き、取得できた複数の本文を照合し、確度に応じて根拠の強さを判断してください。
 1. **まず公式文書、研究論文、規制・標準機関などの一次情報を探し、重要な事実・数値を照合する。**
 2. **一次情報が見つからない、存在しない、アクセスできない、または当該主張を扱っていない場合は、その事情を区別する。検索結果がないだけで「一次情報が存在しない」と断定しない。**
+   公式ソース専用レーンに候補がある場合は、発行元・本文・日付を実際に照合してから「公式情報がない」と判断する。本文取得に失敗した場合は「存在しない」ではなく「確認できなかった」とする。
 3. **一次情報を確認できない場合、編集責任のある専門媒体・業界紙・調査機関など、独自取材や方法を示す高品質な二次情報を優先する。**
 4. **高品質な二次情報を使う場合、同じ主張を裏付ける独立した情報源が複数あるかを確認する。目安は異なる発行元ドメインの2件以上。転載、プレスリリースの再掲、同一通信社記事の配信先違いは独立した裏付けとして数えない。独立性を確認できない場合はその不確かさを明記する。**
 5. **各主張についてソース間の一致・矛盾を確認する。重要な数値・仕様（性能、容量、価格など）は、可能な限り一次情報または複数の独立した根拠で照合する。**
 6. **「other」や信頼性を判断できないソース1件だけに依拠する主張は weak_evidence とする。高品質で独立した複数の二次情報が一致していれば、二次情報のみでも十分と判定してよい。**
 7. **新鮮度スコアが低い情報や、ページ間の矛盾・未確認事項を指摘する。**
 8. **追加検索が有効な不足だけ additional_queries に入れる。一次情報の所在を確かめる検索に加え、裏付けが不足する場合は独立した専門二次情報も探すクエリを提案する。**
+9. run_memo に、次の検索や回答作成に必要な暫定整理を日本語で最大5000文字にまとめる。確認できた事実の要点、未確認点、ソース間の矛盾や古さを残し、根拠のない推測を入れない。これはこの調査実行中だけのメモで、最終回答の根拠にはせず、必ず下の本文と出典で再確認する。
+10. sufficiency は元の質問に対する回答可能性で判定する。質問されていない性能・育成・ガチャ詳細が未確認でも、それだけを理由に不足とはしない。
 
 検索クエリとURLを見て、ソースが独立しているか慎重に判断してください。異なるURLだけでは独立した根拠とは言えません。一次情報がなくても、独立した高品質な二次情報が十分に裏付けるなら sufficient を true にできます。その場合、reason に一次情報を確認できなかった事情と二次情報を採用した理由を簡潔に記してください。
 
@@ -1205,7 +1374,8 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
   "missing_information": ["不足している情報1"],
   "weak_evidence": ["根拠が弱い点1（独立確認のない情報源、矛盾など）"],
   "reason": "評価理由",
-  "additional_queries": ["対象名 不足項目 公式", "対象名 別の不足項目"]
+  "additional_queries": ["対象名 不足項目 公式", "対象名 別の不足項目"],
+  "run_memo": "次の検索や回答に必要な暫定整理。最大5000文字"
 }}
 ```
 
@@ -1225,14 +1395,14 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
                     raise RuntimeError("品質評価モデルから応答を取得できませんでした")
                 repair_prompt = f'''次の品質評価案を、指定形式の有効なJSONに修正してください。
 評価案の内容を保ち、値を推測で追加しないでください。JSON以外は出力しないでください。
-必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[])
+必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[]), run_memo (string)
 additional_queries の各要素は検索文そのものの文字列です。{{"query": "..."}} のようなオブジェクトを配列に入れないでください。
 
 評価案:
 {raw_evaluation}
 
 JSON例:
-{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[]}}'''
+{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"run_memo":"この調査回だけの暫定メモ"}}'''
                 repaired = llm.invoke(repair_prompt)
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
@@ -1305,7 +1475,10 @@ JSON例:
             log_detail(f"  根拠が弱い点: {weak}")
         for query in eval_obj.additional_queries:
             log_detail(f"  追加検索案: {query}")
-        return {"evaluation": eval_obj}
+        memo = (eval_obj.run_memo or state.get("run_memo", ""))[:5000]
+        if memo and memo != state.get("run_memo", ""):
+            log_detail("今回の調査中だけ使う作業メモを更新しました")
+        return {"evaluation": eval_obj, "run_memo": memo}
 
     def should_continue(state: State):
         evaluation = state.get("evaluation")
@@ -1320,6 +1493,17 @@ JSON例:
             return "analyze"
         if not evaluation.additional_queries:
             log_detail("次の判断: 追加検索案がないためレポート作成へ進みます")
+            return "analyze"
+        searched = {
+            re.sub(r"\s+", " ", query).strip().casefold()
+            for query in state.get("searched_queries", [])
+        }
+        pending = [
+            query for query in evaluation.additional_queries
+            if re.sub(r"\s+", " ", query).strip().casefold() not in searched
+        ]
+        if not pending:
+            log_detail("次の判断: 追加検索案がすべて検索済みのため、レポート作成へ進みます")
             return "analyze"
         log_detail("次の判断: 情報不足が残っているため、追加検索を実行します")
         return "additional_search"
@@ -1356,6 +1540,7 @@ JSON例:
         }
         delta_results: list[SearchResult] = []
         delta_evidence_results: list[SearchResult] = []
+        delta_official_results: list[SearchResult] = []
         for query in queries:
             log_detail(f"追加検索開始: {query}")
             query_fresh: list[SearchResult] = []
@@ -1380,6 +1565,7 @@ JSON例:
                 scoring_weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
                 top_query_results = rerank_results(
                     query_fresh, reranker, candidate_count, weights=scoring_weights,
+                    official_domains=settings.official_domains,
                 )
                 if fetcher:
                     top_query_results = populate_content(
@@ -1389,8 +1575,11 @@ JSON例:
                         max_length=settings.max_content_length,
                         fallback_fetcher=fallback_fetcher,
                         weights=scoring_weights,
+                        official_domains=settings.official_domains,
                     )
                 delta_evidence_results.extend(top_query_results)
+                if re.search(r"(?:公式|お知らせ|告知|official|announcement|press release)", query, re.IGNORECASE):
+                    delta_official_results.extend(top_query_results)
                 log_detail(f"品質評価用に追加検索の本文候補 {len(top_query_results)}件を保持します")
                 top_query_results = select_diverse_results(
                     top_query_results, settings.reranked_results_per_query,
@@ -1406,13 +1595,19 @@ JSON例:
         return {
             "results": delta_results,
             "evidence_results": delta_evidence_results,
+            "official_results": delta_official_results,
             "search_query_count": len(queries),
             "search_round": 1,
             "searched_queries": queries,
         }
 
     def analyze(state: State):
-        unique_results = _evaluation_sources(state.get("results", []))
+        candidate_results = deduplicate_results(
+            state.get("results", []) + state.get("official_results", [])
+        )
+        unique_results = _evaluation_sources(
+            candidate_results, official_candidates=state.get("official_results", []),
+        )
         log_detail(f"レポート作成: 関連度と出典分散で選んだ根拠ソース {len(unique_results)}件を使用")
         formatted_evidence = format_results_for_llm(unique_results)
         evaluation = state.get("evaluation")
@@ -1425,9 +1620,13 @@ JSON例:
 評価理由: {evaluation.reason}
 未確認事項: {", ".join(evaluation.missing_information) or "なし"}
 レポートでは冒頭に調査が不完全であることを明記し、根拠から確認できる範囲と未確認事項を区別してください。"""
+        run_memo = (state.get("run_memo", "") or "（まだありません）")[:5000]
         answer_prompt = f"""以下のWeb検索結果および取得したWebページ本文だけを根拠に質問へ回答してください。
 現在日（この調査の基準日）: {current_date}
 質問: {state['query']}
+
+この調査回だけの作業メモ（索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
+{run_memo}
 
 収集された情報源:
 {formatted_evidence}
@@ -1439,7 +1638,8 @@ JSON例:
 3. 事実を述べる段落には、根拠にした出典番号 [S1] の形式を付けてください。複数なら [S1][S2] とします。
 4. 検索結果にない出典番号やURLを本文に書かないでください。参照ソース一覧はプログラムが付けます。
 5. 取得情報から確認できないことは断定せず、調査品質が不十分な場合はその制約を明記してください。
-6. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
+6. 元の質問で求められていない性能・育成・ガチャ詳細を必須情報のように付け加えず、公式確定情報とリーク・予想を明確に分けてください。
+7. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
         answer = strip_model_reasoning(llm.invoke(answer_prompt).content)
         issues = citation_issues(answer, len(unique_results))
         has_citations = bool(_SOURCE_REF_RE.search(answer))
@@ -1472,12 +1672,14 @@ JSON例:
     builder = StateGraph(State)
     builder.add_node("planner", planner)
     builder.add_node("search", search_task)
+    builder.add_node("official_search", official_search)
     builder.add_node("evaluate", evaluate)
     builder.add_node("additional_search", additional_search)
     builder.add_node("analyze", analyze)
     builder.add_edge(START, "planner")
     builder.add_conditional_edges("planner", dispatch_searches)
     builder.add_edge("search", "evaluate")
+    builder.add_edge("official_search", "evaluate")
     builder.add_conditional_edges("evaluate", should_continue, {
         "analyze": "analyze", "additional_search": "additional_search",
     })

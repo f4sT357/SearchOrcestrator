@@ -110,6 +110,7 @@ def main(argv: list[str] | None = None) -> None:
         relevance_weight=relevance_weight,
         trust_weight=trust_weight,
         freshness_weight=freshness_weight,
+        official_domains=settings.official_domains,
     )
 
     workflow = create_workflow(settings)
@@ -120,7 +121,9 @@ def main(argv: list[str] | None = None) -> None:
             "task": None,
             "results": [],
             "evidence_results": [],
+            "official_results": [],
             "evaluation": None,
+            "run_memo": "",
             "summary": "",
             "search_query_count": 0,
             "search_round": 0,

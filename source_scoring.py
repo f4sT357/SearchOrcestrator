@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from datetime import date, datetime
 from urllib.parse import urlparse
 
@@ -21,7 +22,7 @@ from urllib.parse import urlparse
 # Domain databases
 # ---------------------------------------------------------------------------
 
-# Primary sources – vendor/official technical documentation & IR pages
+# Primary sources – official organization, product, research, and standards domains
 PRIMARY_DOMAINS: frozenset[str] = frozenset({
     # NVIDIA
     "nvidia.com",
@@ -120,16 +121,54 @@ def _normalise_domain(url: str) -> str:
     """Extract the *effective* domain from *url* (strips www. prefix)."""
     try:
         host = urlparse(url).hostname or ""
-        return host.removeprefix("www.")
+        return host.rstrip(".").lower().removeprefix("www.")
     except Exception:
         return ""
 
 
-def source_tier(url: str) -> str:
+def normalize_official_domains(domains: Iterable[str] | None) -> tuple[str, ...]:
+    """Normalize user-registered hosts, accepting either hostnames or URLs.
+
+    Registered domains match themselves and their subdomains. Only register
+    domains independently confirmed by the user as official.
+    """
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if isinstance(domains, str):
+        domains = re.split(r"[,;\r\n]+", domains)
+    for entry in domains or ():
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        candidate = entry.strip()
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        host = (parsed.hostname or "").rstrip(".").lower().removeprefix("www.")
+        if not host:
+            raise ValueError(f"公式ドメインを解釈できません: {entry}")
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(f"公式ドメインを解釈できません: {entry}") from exc
+        labels = host.split(".")
+        if len(labels) < 2 or any(
+            not label or len(label) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        ):
+            raise ValueError(f"公式ドメインの形式が正しくありません: {entry}")
+        if host not in seen:
+            normalized.append(host)
+            seen.add(host)
+    return tuple(normalized)
+
+
+def source_tier(url: str, official_domains: Iterable[str] = ()) -> str:
     """Return ``"primary"``, ``"secondary"``, or ``"other"`` for *url*."""
     domain = _normalise_domain(url)
     if not domain:
         return "other"
+    registered_domains = normalize_official_domains(official_domains)
+    if any(domain == registered or domain.endswith("." + registered) for registered in registered_domains):
+        return "primary"
     # Exact match
     if domain in PRIMARY_DOMAINS:
         return "primary"
@@ -224,9 +263,9 @@ def freshness_score(
         return 0.5
 
 
-def domain_trust_score(url: str) -> float:
+def domain_trust_score(url: str, official_domains: Iterable[str] = ()) -> float:
     """Return a trust score (0-1) based on the domain tier of *url*."""
-    return TRUST_SCORES[source_tier(url)]
+    return TRUST_SCORES[source_tier(url, official_domains)]
 
 
 def composite_score(
@@ -237,6 +276,7 @@ def composite_score(
     w_relevance: float = 0.50,
     w_trust: float = 0.30,
     w_freshness: float = 0.20,
+    official_domains: Iterable[str] = (),
 ) -> float:
     """Combine relevance, trust, and freshness into a single ranking score.
 
@@ -250,7 +290,7 @@ def composite_score(
     if abs(sum(weights) - 1.0) > 1e-6:
         raise ValueError("Composite score weights must sum to 1")
 
-    trust = domain_trust_score(url)
+    trust = domain_trust_score(url, official_domains)
     fresh = freshness_score(url, content=content)
     if relevance is None:
         total_w = w_trust + w_freshness
@@ -261,6 +301,7 @@ def composite_score(
 __all__ = [
     "PRIMARY_DOMAINS",
     "SECONDARY_DOMAINS",
+    "normalize_official_domains",
     "source_tier",
     "extract_content_date",
     "freshness_score",
