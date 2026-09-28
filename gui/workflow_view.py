@@ -14,19 +14,21 @@ class WorkflowProgressView(QWidget):
     """Show each workflow stage and update its state as graph nodes run."""
 
     CANVAS_WIDTH = 900
-    CANVAS_HEIGHT = 650
+    CANVAS_HEIGHT = 730
 
     NODE_RECTS = {
-        "planner": QRectF(325, 55, 250, 68),
-        "search": QRectF(65, 175, 250, 68),
-        "official_search": QRectF(585, 175, 250, 68),
-        "evaluate": QRectF(325, 285, 250, 68),
-        "board_update": QRectF(325, 375, 250, 68),
-        "additional_search": QRectF(585, 375, 250, 68),
-        "analyze": QRectF(325, 480, 250, 68),
-        "complete": QRectF(350, 575, 200, 58),
+        "understand_input": QRectF(325, 55, 250, 68),
+        "planner": QRectF(325, 150, 250, 68),
+        "search": QRectF(65, 260, 250, 68),
+        "official_search": QRectF(585, 260, 250, 68),
+        "evaluate": QRectF(325, 370, 250, 68),
+        "board_update": QRectF(325, 460, 250, 68),
+        "additional_search": QRectF(585, 460, 250, 68),
+        "analyze": QRectF(325, 560, 250, 68),
+        "complete": QRectF(350, 655, 200, 58),
     }
     NODE_LABELS = {
+        "understand_input": "依頼内容を理解して記録",
         "planner": "調査計画を作る",
         "search": "通常のWeb検索",
         "official_search": "公式情報を探す",
@@ -143,12 +145,12 @@ class WorkflowProgressView(QWidget):
             painter.drawText(QRectF(position.x() - 70, position.y() - 12, 140, 22), Qt.AlignmentFlag.AlignCenter, label)
 
     def _draw_loop(self, painter: QPainter) -> None:
-        path = QPainterPath(QPointF(710, 375))
-        path.cubicTo(QPointF(865, 340), QPointF(865, 305), QPointF(575, 319))
+        path = QPainterPath(QPointF(710, 460))
+        path.cubicTo(QPointF(865, 440), QPointF(865, 385), QPointF(575, 404))
         painter.setPen(QPen(QColor("#8994a3"), 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
-        end = QPointF(575, 319)
+        end = QPointF(575, 404)
         before = path.pointAtPercent(0.98)
         angle = math.atan2(end.y() - before.y(), end.x() - before.x())
         left = QPointF(end.x() - 9 * math.cos(angle - math.pi / 6), end.y() - 9 * math.sin(angle - math.pi / 6))
@@ -156,7 +158,7 @@ class WorkflowProgressView(QWidget):
         painter.setBrush(QColor("#8994a3"))
         painter.drawPolygon(QPolygonF([end, left, right]))
         painter.setPen(QColor("#586273"))
-        painter.drawText(QRectF(740, 300, 110, 24), Qt.AlignmentFlag.AlignCenter, "再評価へ")
+        painter.drawText(QRectF(740, 390, 110, 24), Qt.AlignmentFlag.AlignCenter, "再評価へ")
 
     def _draw_node(self, painter: QPainter, name: str, rect: QRectF) -> None:
         state = self._states.get(name, "pending")
@@ -231,6 +233,7 @@ class WorkflowProgressView(QWidget):
         painter.setPen(QColor("#596273"))
         painter.drawText(QRectF(24, 35, self.CANVAS_WIDTH - 48, 20), Qt.AlignmentFlag.AlignLeft, self._overall_detail)
 
+        understand = self.NODE_RECTS["understand_input"]
         planner = self.NODE_RECTS["planner"]
         search = self.NODE_RECTS["search"]
         official = self.NODE_RECTS["official_search"]
@@ -239,13 +242,14 @@ class WorkflowProgressView(QWidget):
         additional = self.NODE_RECTS["additional_search"]
         analyze = self.NODE_RECTS["analyze"]
         complete = self.NODE_RECTS["complete"]
+        self._draw_arrow(painter, QPointF(understand.center().x(), understand.bottom()), QPointF(planner.center().x(), planner.top()))
         self._draw_arrow(painter, QPointF(planner.center().x() - 30, planner.bottom()), QPointF(search.center().x(), search.top()))
         self._draw_arrow(painter, QPointF(planner.center().x() + 30, planner.bottom()), QPointF(official.center().x(), official.top()))
         self._draw_arrow(painter, QPointF(search.right(), search.center().y()), QPointF(evaluate.left(), evaluate.center().y() - 8))
         self._draw_arrow(painter, QPointF(official.left(), official.center().y()), QPointF(evaluate.right(), evaluate.center().y() - 8))
         self._draw_arrow(painter, QPointF(evaluate.center().x(), evaluate.bottom()), QPointF(board.center().x(), board.top()))
-        self._draw_arrow(painter, QPointF(board.center().x(), board.bottom()), QPointF(analyze.center().x(), analyze.top()), label="追加調査しない", label_position=QPointF(450, 465))
-        self._draw_arrow(painter, QPointF(board.right(), board.center().y()), QPointF(additional.left(), additional.center().y()), label="不足がある", label_position=QPointF(580, 355))
+        self._draw_arrow(painter, QPointF(board.center().x(), board.bottom()), QPointF(analyze.center().x(), analyze.top()), label="追加調査しない", label_position=QPointF(450, 545))
+        self._draw_arrow(painter, QPointF(board.right(), board.center().y()), QPointF(additional.left(), additional.center().y()), label="不足がある", label_position=QPointF(580, 440))
         self._draw_loop(painter)
         self._draw_arrow(painter, QPointF(analyze.center().x(), analyze.bottom()), QPointF(complete.center().x(), complete.top()))
         for name, rect in self.NODE_RECTS.items():

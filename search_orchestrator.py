@@ -236,6 +236,7 @@ class SearchResult(BaseModel):
 
 class State(TypedDict):
     query: str
+    understood_request: str
     plan: SearchPlan | None
     task: SearchTask | None
     results: Annotated[list[SearchResult], operator.add]
@@ -1112,6 +1113,8 @@ def create_workflow(
                     detail += f" / {evaluation.additional_queries[0]}"
             elif stage == "evaluate":
                 detail = f"検索 {state.get('search_round', 0) + 1}回目の結果"
+            elif stage == "understand_input":
+                detail = "ユーザーの依頼内容を整理"
             report_progress(stage, "started", detail)
             try:
                 result = node(state)
@@ -1142,11 +1145,47 @@ def create_workflow(
                 f" / 本文 {status}{page_date}"
             )
 
+    def understand_input(state: State):
+        query = state["query"].strip()
+        prompt = f"""あなたは調査依頼の受付担当です。ユーザーの入力だけを読み、後続の調査計画が誤解なく作れるよう依頼内容を短く整理してください。
+
+入力の意図を次の項目で日本語でまとめてください。
+- 調べたい対象と目的
+- ユーザーが知りたい観点や求める成果
+- 明示された条件・範囲・時点
+- 曖昧な点や、調査時に決めつけず確認すべき点
+
+入力にない事実や条件を補わず、推測が必要なら不明として記録してください。外部調査はまだ行わず、思考過程も出力せず、整理結果だけを最大1200文字で出力してください。
+
+ユーザーの入力:
+{query}"""
+        try:
+            understood = strip_model_reasoning(llm.invoke(prompt).content).strip()
+        except Exception as error:
+            understood = ""
+            log_detail(f"入力内容の整理に失敗しました。原文を使って続行します: {error}")
+        if not understood:
+            understood = f"モデルによる整理はできなかったため、入力原文を調査対象として扱います。\n{query}"
+        understood = understood[:1200]
+        post = f"依頼の理解: {understood} / 入力原文: {query}"
+        memo, added_posts, evicted_posts = append_run_memo_posts(
+            state.get("run_memo", ""), [post], max_chars=5000,
+        )
+        if added_posts:
+            log_detail("調査ボードに依頼内容の理解を記録しました:")
+            log_detail(f"  {added_posts[0]}")
+            if board_update is not None:
+                board_update(memo)
+        if evicted_posts:
+            log_detail(f"共有ボードの文字数上限により古い投稿を {evicted_posts}件整理しました")
+        return {"understood_request": understood, "run_memo": memo}
+
     def planner(state: State):
         prompt = f"""あなたはリサーチプランナーです。現在日: {current_date}
-質問: {state['query']}
+ユーザーの入力: {state['query']}
+入力内容の整理: {state.get('understood_request', '') or '（整理情報なし。入力原文を優先してください）'}
 
-重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。
+入力内容の整理は依頼の意図を理解するための補助です。元の入力と食い違う場合は元の入力を優先し、整理に書かれていない要望を追加しないでください。重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。
 
 通常の調査計画とは別に、運営元・公式サイト・公式告知・公式文書を探すための official_queries を最大5件作ってください。検索語や検索先を少しずつ変え、公式発表・お知らせ・更新履歴・公式SNSや配信ページなど、質問に合う一次情報の入口を複数探します。検索語には「公式」「告知」「お知らせ」「公式サイト」などを含めます。対象が特定できない site: ドメインを推測して付けないでください。このレーンは一次情報を探す専用であり、見つかったページが本当に公式かは後で本文と発行元を確認します。
 
@@ -1830,6 +1869,7 @@ JSON例:
         return {"summary": render_verified_sources(answer, unique_results)}
 
     builder = StateGraph(State)
+    builder.add_node("understand_input", track_node("understand_input", understand_input))
     builder.add_node("planner", track_node("planner", planner))
     builder.add_node("search", track_node("search", search_task))
     builder.add_node("official_search", track_node("official_search", official_search))
@@ -1837,7 +1877,8 @@ JSON例:
     builder.add_node("board_update", track_node("board_update", update_board))
     builder.add_node("additional_search", track_node("additional_search", additional_search))
     builder.add_node("analyze", track_node("analyze", analyze))
-    builder.add_edge(START, "planner")
+    builder.add_edge(START, "understand_input")
+    builder.add_edge("understand_input", "planner")
     builder.add_conditional_edges("planner", dispatch_searches)
     builder.add_edge("search", "evaluate")
     builder.add_edge("official_search", "evaluate")

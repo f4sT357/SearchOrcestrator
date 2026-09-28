@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     result = workflow.invoke(
         {
             "query": args.query,
+            "understood_request": "",
             "plan": None,
             "task": None,
             "results": [],

@@ -84,6 +84,7 @@ class ResearchWorker(QThread):
             self.log_signal.emit(f"調査を開始します: 「{self.query}」")
             initial_state = {
                 "query": self.query,
+                "understood_request": "",
                 "plan": None,
                 "task": None,
                 "results": [],
@@ -97,7 +98,7 @@ class ResearchWorker(QThread):
                 "searched_queries": [],
             }
 
-            self.log_signal.emit("調査計画の立案およびWeb検索を実行中...")
+            self.log_signal.emit("依頼内容を整理し、調査計画の立案とWeb検索を実行中...")
             result = workflow.invoke(
                 initial_state,
                 {"max_concurrency": self.max_concurrency},
