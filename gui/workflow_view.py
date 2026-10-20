@@ -15,17 +15,19 @@ class WorkflowProgressView(QWidget):
     """Show the parallel search lanes and live state of each workflow stage."""
 
     CANVAS_WIDTH = 1000
-    CANVAS_HEIGHT = 590
+    CANVAS_HEIGHT = 660
 
     NODE_RECTS = {
         "understand_input": QRectF(40, 82, 250, 78),
         "planner": QRectF(375, 82, 250, 78),
         "search": QRectF(20, 235, 310, 100),
         "official_search": QRectF(670, 235, 310, 100),
-        "evaluate": QRectF(380, 385, 240, 80),
-        "board_update": QRectF(380, 500, 240, 70),
-        "analyze": QRectF(40, 500, 250, 70),
-        "additional_search": QRectF(710, 500, 250, 70),
+        "evaluate": QRectF(380, 350, 240, 75),
+        "board_update": QRectF(380, 450, 240, 60),
+        "prepare_followups": QRectF(380, 520, 240, 60),
+        "analyze": QRectF(40, 600, 250, 60),
+        "additional_search": QRectF(350, 600, 300, 60),
+        "official_additional_search": QRectF(670, 600, 300, 60),
     }
     NODE_LABELS = {
         "understand_input": "依頼内容を整理",
@@ -34,7 +36,9 @@ class WorkflowProgressView(QWidget):
         "official_search": "公式情報を検索",
         "evaluate": "根拠と情報の不足を評価",
         "board_update": "確認事項を整理",
+        "prepare_followups": "追加検索クエリを配分",
         "additional_search": "不足分を追加検索",
+        "official_additional_search": "公式情報を追加検索",
         "analyze": "レポートを作成",
     }
     NODE_HINTS = {
@@ -44,7 +48,9 @@ class WorkflowProgressView(QWidget):
         "official_search": "一次情報の候補を順に検索",
         "evaluate": "出典・本文・不足項目を確認",
         "board_update": "次の検索に使う情報を記録",
+        "prepare_followups": "不足・重複・上限を確認してレーン別に分配",
         "additional_search": "不足している観点を再調査",
+        "official_additional_search": "公式発表・一次資料の不足を再調査",
         "analyze": "取得した根拠から回答を生成",
     }
 
@@ -190,7 +196,7 @@ class WorkflowProgressView(QWidget):
                 return details[0] if len(details) == 1 else f"{len(details)}件を並行処理中"
         elif self._activity[name] and state in {"completed", "failed"}:
             return self._activity[name]
-        return self.NODE_HINTS[name]
+        return ""
 
     def _stage_counts(self) -> tuple[int, int]:
         complete = sum(state in {"completed", "skipped"} for state in self._states.values())
@@ -241,18 +247,32 @@ class WorkflowProgressView(QWidget):
             painter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
             painter.drawText(label_rect or QRectF(points[-1].x() - 50, points[-1].y() - 20, 100, 18), Qt.AlignmentFlag.AlignCenter, label)
 
-    def _draw_retry_loop(self, painter: QPainter) -> None:
-        color = self._edge_color("additional_search", "evaluate")
-        path = QPainterPath(QPointF(835, 500))
-        path.cubicTo(QPointF(900, 465), QPointF(955, 465), QPointF(955, 430))
-        path.cubicTo(QPointF(955, 395), QPointF(785, 425), QPointF(620, 425))
+    def _draw_retry_loop(self, painter: QPainter, lane: str) -> None:
+        if lane == "official":
+            node = self.NODE_RECTS["official_additional_search"]
+            color = self._edge_color("official_additional_search", "evaluate")
+            start = QPointF(node.center().x(), node.top())
+            end = QPointF(self.NODE_RECTS["evaluate"].right(), self.NODE_RECTS["evaluate"].center().y())
+            path = QPainterPath(start)
+            path.cubicTo(QPointF(900, 585), QPointF(970, 555), QPointF(970, 515))
+            path.cubicTo(QPointF(970, 475), QPointF(800, end.y()), end)
+            label_rect = QRectF(850, 520, 100, 18)
+        else:
+            node = self.NODE_RECTS["additional_search"]
+            color = self._edge_color("additional_search", "evaluate")
+            start = QPointF(node.center().x(), node.top())
+            end = QPointF(self.NODE_RECTS["evaluate"].left(), self.NODE_RECTS["evaluate"].center().y())
+            path = QPainterPath(start)
+            path.cubicTo(QPointF(100, 585), QPointF(30, 555), QPointF(30, 515))
+            path.cubicTo(QPointF(30, 405), QPointF(200, end.y()), end)
+            label_rect = QRectF(45, 520, 100, 18)
         painter.setPen(QPen(color, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
-        self._draw_arrow_head(painter, QPointF(785, 425), QPointF(620, 425), color)
+        self._draw_arrow_head(painter, path.pointAtPercent(0.99), end, color)
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
         painter.setPen(self.COLORS["muted"])
-        painter.drawText(QRectF(800, 418, 105, 18), Qt.AlignmentFlag.AlignCenter, "再評価")
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, "再評価")
 
     def _draw_node(self, painter: QPainter, name: str, rect: QRectF) -> None:
         state = self._states[name]
@@ -283,18 +303,20 @@ class WorkflowProgressView(QWidget):
 
         painter.setPen(self.COLORS["muted"])
         painter.setFont(QFont("Segoe UI", 8))
-        hint_rect = QRectF(rect.x() + 16, rect.y() + 35, rect.width() - 28, 18)
-        painter.drawText(hint_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.NODE_HINTS[name])
-
         detail = self._node_detail(name)
-        detail_rect = QRectF(rect.x() + 16, rect.y() + rect.height() - 27, rect.width() - 28, 18)
-        painter.setPen(accent if state in {"active", "failed"} else self.COLORS["muted"])
-        metrics = QFontMetrics(painter.font())
-        painter.drawText(
-            detail_rect,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            metrics.elidedText(detail, Qt.TextElideMode.ElideRight, int(detail_rect.width())),
-        )
+        hint_rect = QRectF(rect.x() + 16, rect.y() + 35, rect.width() - 28, 18)
+        if not (detail and rect.height() <= 72):
+            painter.drawText(hint_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.NODE_HINTS[name])
+
+        if detail and detail != self.NODE_HINTS[name]:
+            detail_rect = QRectF(rect.x() + 16, rect.y() + rect.height() - 27, rect.width() - 28, 18)
+            painter.setPen(accent if state in {"active", "failed"} else self.COLORS["muted"])
+            metrics = QFontMetrics(painter.font())
+            painter.drawText(
+                detail_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                metrics.elidedText(detail, Qt.TextElideMode.ElideRight, int(detail_rect.width())),
+            )
 
     def paintEvent(self, event: Any) -> None:
         del event
@@ -342,8 +364,10 @@ class WorkflowProgressView(QWidget):
         official_rect = self.NODE_RECTS["official_search"]
         evaluate_rect = self.NODE_RECTS["evaluate"]
         board_rect = self.NODE_RECTS["board_update"]
+        prepare_rect = self.NODE_RECTS["prepare_followups"]
         analyze_rect = self.NODE_RECTS["analyze"]
         additional_rect = self.NODE_RECTS["additional_search"]
+        official_additional_rect = self.NODE_RECTS["official_additional_search"]
 
         self._draw_connector(
             painter,
@@ -377,19 +401,32 @@ class WorkflowProgressView(QWidget):
         )
         self._draw_connector(
             painter,
-            [QPointF(board_rect.left(), board_rect.center().y()), QPointF(analyze_rect.right(), analyze_rect.center().y())],
-            "board_update", "analyze",
-            label="回答可能",
-            label_rect=QRectF(285, 515, 95, 20),
+            [QPointF(board_rect.center().x(), board_rect.bottom()), QPointF(prepare_rect.center().x(), prepare_rect.top())],
+            "board_update", "prepare_followups",
         )
         self._draw_connector(
             painter,
-            [QPointF(board_rect.right(), board_rect.center().y()), QPointF(additional_rect.left(), additional_rect.center().y())],
-            "board_update", "additional_search",
-            label="不足あり",
-            label_rect=QRectF(620, 515, 90, 20),
+            [QPointF(prepare_rect.left(), prepare_rect.center().y()), QPointF(320, prepare_rect.center().y()), QPointF(320, analyze_rect.center().y()), QPointF(analyze_rect.right(), analyze_rect.center().y())],
+            "prepare_followups", "analyze",
+            label="追加なし・上限",
+            label_rect=QRectF(265, 605, 115, 18),
         )
-        self._draw_retry_loop(painter)
+        self._draw_connector(
+            painter,
+            [QPointF(prepare_rect.center().x(), prepare_rect.bottom()), QPointF(additional_rect.center().x(), additional_rect.top())],
+            "prepare_followups", "additional_search",
+            label="通常クエリあり",
+            label_rect=QRectF(515, 580, 125, 18),
+        )
+        self._draw_connector(
+            painter,
+            [QPointF(prepare_rect.right(), prepare_rect.center().y()), QPointF(650, prepare_rect.center().y()), QPointF(650, official_additional_rect.center().y()), QPointF(official_additional_rect.left(), official_additional_rect.center().y())],
+            "prepare_followups", "official_additional_search",
+            label="公式クエリあり",
+            label_rect=QRectF(655, 580, 125, 18),
+        )
+        self._draw_retry_loop(painter, "normal")
+        self._draw_retry_loop(painter, "official")
 
         for name, rect in self.NODE_RECTS.items():
             self._draw_node(painter, name, rect)
