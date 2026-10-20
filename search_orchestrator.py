@@ -1335,13 +1335,21 @@ def create_workflow(
             settings.content_candidate_results_per_query
             if fetcher else settings.reranked_results_per_query
         )
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
+            report_progress(
+                "official_search", "progress",
+                f"{query_index}/{len(queries)}件目 · 検索中: {query}",
+            )
             log_detail(f"公式ソース専用検索: {query}")
             searched_queries.append(query)
             candidates: list[SearchResult] = []
             try:
                 response = search.text(query, max_results=settings.results_per_query)
                 add_search_results(candidates, response, query)
+                report_progress(
+                    "official_search", "progress",
+                    f"{query_index}/{len(queries)}件目 · 候補 {len(candidates)}件",
+                )
                 log_detail(f"公式ソース検索候補: {len(candidates)}件")
             except Exception as error:
                 if "no results found" in str(error).casefold():
@@ -1354,6 +1362,10 @@ def create_workflow(
                 official_domains=settings.official_domains,
             )
             if fetcher:
+                report_progress(
+                    "official_search", "progress",
+                    f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(query_candidates)}件）",
+                )
                 query_candidates = populate_content(
                     query_candidates, fetcher, timeout=settings.fetch_timeout,
                     max_length=settings.max_content_length,
@@ -1401,6 +1413,7 @@ def create_workflow(
                 "searched_queries": [task.query],
             }
 
+        report_progress("search", "progress", f"候補 {len(fresh_results)}件 · {task.query}")
         log_detail(f"検索候補: {len(fresh_results)}件（取得上限: {settings.results_per_query}）")
 
         candidate_count = (
@@ -1414,6 +1427,7 @@ def create_workflow(
         )
         log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
         if fetcher:
+            report_progress("search", "progress", f"本文を取得中（候補 {len(top_results)}件） · {task.query}")
             top_results = populate_content(
                 top_results,
                 fetcher,
@@ -1740,7 +1754,11 @@ JSON例:
         delta_results: list[SearchResult] = []
         delta_evidence_results: list[SearchResult] = []
         delta_official_results: list[SearchResult] = []
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
+            report_progress(
+                "additional_search", "progress",
+                f"{query_index}/{len(queries)}件目 · 検索中: {query}",
+            )
             log_detail(f"追加検索開始: {query}")
             query_fresh: list[SearchResult] = []
             try:
@@ -1757,6 +1775,10 @@ JSON例:
                 log_detail(
                     f"追加検索候補: {len(query_fresh)}件（既出URLを除外、取得上限: {settings.results_per_query}）"
                 )
+                report_progress(
+                    "additional_search", "progress",
+                    f"{query_index}/{len(queries)}件目 · 新規候補 {len(query_fresh)}件",
+                )
                 candidate_count = (
                     settings.content_candidate_results_per_query
                     if fetcher else settings.reranked_results_per_query
@@ -1767,6 +1789,10 @@ JSON例:
                     official_domains=settings.official_domains,
                 )
                 if fetcher:
+                    report_progress(
+                        "additional_search", "progress",
+                        f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(top_query_results)}件）",
+                    )
                     top_query_results = populate_content(
                         top_query_results,
                         fetcher,
