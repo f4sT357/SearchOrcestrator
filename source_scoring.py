@@ -164,21 +164,35 @@ def source_tier(url: str, official_domains: Iterable[str] = ()) -> str:
     domain = _normalise_domain(url)
     if not domain:
         return "other"
-    registered_domains = normalize_official_domains(official_domains)
-    if any(domain == registered or domain.endswith("." + registered) for registered in registered_domains):
-        return "primary"
+
+    # Check registered official domains
+    if official_domains:
+        if isinstance(official_domains, (set, frozenset)):
+            registered_set = official_domains
+        else:
+            registered_set = set(normalize_official_domains(official_domains))
+        if domain in registered_set:
+            return "primary"
+        parts = domain.split(".")
+        for i in range(1, len(parts) - 1):
+            if ".".join(parts[i:]) in registered_set:
+                return "primary"
+
     # Exact match
     if domain in PRIMARY_DOMAINS:
         return "primary"
     if domain in SECONDARY_DOMAINS:
         return "secondary"
-    # Suffix match (sub-domains)
-    for d in PRIMARY_DOMAINS:
-        if domain.endswith("." + d):
+
+    # Sub-domains lookup by parent hierarchy: O(depth) set lookup instead of O(N) iteration
+    parts = domain.split(".")
+    for i in range(1, len(parts) - 1):
+        parent = ".".join(parts[i:])
+        if parent in PRIMARY_DOMAINS:
             return "primary"
-    for d in SECONDARY_DOMAINS:
-        if domain.endswith("." + d):
+        if parent in SECONDARY_DOMAINS:
             return "secondary"
+
     return "other"
 
 

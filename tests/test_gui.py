@@ -61,7 +61,7 @@ def test_worker_logs_selected_fetcher_without_logging_api_key(monkeypatch) -> No
         def invoke(self, state, options):
             return {"summary": "done", "results": []}
 
-    monkeypatch.setattr("gui.worker.create_workflow", lambda settings, log: FakeWorkflow())
+    monkeypatch.setattr("gui.worker.create_workflow", lambda *args, **kwargs: FakeWorkflow())
     settings = Settings(
         content_fetcher="firecrawl",
         firecrawl_api_url="http://localhost:3002",

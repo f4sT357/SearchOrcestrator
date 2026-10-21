@@ -47,7 +47,9 @@ if parent_dir not in sys.path:
 
 import json
 from gui.workflow_view import WorkflowProgressView
+from PySide6.QtCore import QThreadPool
 from gui.worker import (
+    ModelFetchRunnable,
     RerankerPreloadSignals,
     ResearchWorker,
     preload_reranker_background,
@@ -63,6 +65,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.worker: ResearchWorker | None = None
+        self.model_fetch_worker: ModelFetchWorker | None = None
         self.last_results: list[SearchResult] = []
         self.default_settings = Settings.from_environment()
         self.config_path = os.path.join(parent_dir, "config.json")
@@ -77,15 +80,9 @@ class MainWindow(QMainWindow):
         self._reranker_preload_signals = RerankerPreloadSignals(self)
         self._reranker_preload_signals.ready.connect(self._on_reranker_preloaded)
         self._reranker_preload_signals.failed.connect(self._on_reranker_preload_failed)
-        self._reranker_preload_thread = Thread(
-            target=preload_reranker_background,
-            args=(self.default_settings.reranker_model, self._reranker_preload_signals),
-            name="cross-encoder-preload",
-            daemon=True,
-        )
         self.status_label.setText("CrossEncoderをバックグラウンドで準備中...")
         self._log("GUI起動後のバックグラウンドでCrossEncoderを読み込みます")
-        self._reranker_preload_thread.start()
+        preload_reranker_background(self.default_settings.reranker_model, self._reranker_preload_signals)
 
         # Fetch models once on application startup as requested
         self._refresh_model_list(show_feedback=False)
@@ -182,6 +179,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Base URL (APIエンドポイント):", self.base_url_edit)
 
         self.api_key_edit = QLineEdit(self.default_settings.api_key, self)
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_edit.setToolTip("AIへの接続に必要な合言葉です。PC内のLM Studioで認証を設定していなければ、初期値のままで使えます。")
         settings_layout.addRow("APIキー:", self.api_key_edit)
 
@@ -487,12 +485,23 @@ class MainWindow(QMainWindow):
         self._refresh_model_list(show_feedback=True)
 
     def _refresh_model_list(self, show_feedback: bool = False) -> None:
-        """Fetch available models from the configured base_url (only on startup or button click)."""
+        """Fetch available models from the configured base_url asynchronously via QThreadPool."""
         base_url = self.base_url_edit.text().strip() or self.default_settings.base_url
         api_key = self.api_key_edit.text().strip()
+
+        self.refresh_models_btn.setEnabled(False)
+        self.refresh_models_btn.setText("🔄 取得中...")
+
+        runnable = ModelFetchRunnable(base_url=base_url, api_key=api_key, show_feedback=show_feedback)
+        runnable.signals.models_fetched.connect(self._on_models_fetched)
+        runnable.signals.fetch_failed.connect(self._on_models_fetch_failed)
+        QThreadPool.globalInstance().start(runnable)
+
+    def _on_models_fetched(self, models: list[str], show_feedback: bool) -> None:
+        self.refresh_models_btn.setEnabled(True)
+        self.refresh_models_btn.setText("🔄 AIモデル一覧を更新")
         current_selection = self.model_combo.currentText().strip()
 
-        models = fetch_available_models(base_url=base_url, api_key=api_key, timeout=3.0)
         if models:
             self.model_combo.clear()
             for m in models:
@@ -510,11 +519,24 @@ class MainWindow(QMainWindow):
                 )
         else:
             if show_feedback:
+                base_url = self.base_url_edit.text().strip() or self.default_settings.base_url
                 QMessageBox.warning(
                     self,
                     "モデル取得不可",
                     f"エンドポイント ({base_url}) からモデル一覧を取得できませんでした。\nLM Studio が起動しているか確認してください。",
                 )
+
+    def _on_models_fetch_failed(self, error: str, show_feedback: bool) -> None:
+        self.refresh_models_btn.setEnabled(True)
+        self.refresh_models_btn.setText("🔄 AIモデル一覧を更新")
+        self._log(f"モデル一覧の取得中にエラーが発生しました: {error}")
+        if show_feedback:
+            base_url = self.base_url_edit.text().strip() or self.default_settings.base_url
+            QMessageBox.warning(
+                self,
+                "モデル取得エラー",
+                f"エンドポイント ({base_url}) へのリクエストに失敗しました: {error}",
+            )
 
     def _save_config(self) -> None:
         data = {
@@ -539,11 +561,14 @@ class MainWindow(QMainWindow):
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log(f"設定の保存に失敗しました: {exc}")
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"設定の保存に失敗しました: {exc}")
 
     def closeEvent(self, event: Any) -> None:
         self._save_config()
+        QThreadPool.globalInstance().waitForDone(500)
         super().closeEvent(event)
 
     def _on_start_clicked(self) -> None:

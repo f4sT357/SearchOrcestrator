@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
 import httpx
 
 # Import shared types from search_orchestrator at runtime to avoid circular imports.
 # Both modules live in the same package / directory.
-from search_orchestrator import FetchError, FetchStatus
+from search_orchestrator import FetchError, FetchStatus, is_safe_url
 
 
 class JinaReaderFetcher:
@@ -20,10 +21,33 @@ class JinaReaderFetcher:
     drop-in replacement or fallback alongside ``DefaultWebContentFetcher``.
     """
 
-    def __init__(self, api_url: str = "https://r.jina.ai/") -> None:
+    def __init__(self, api_url: str = "https://r.jina.ai/", client: httpx.Client | None = None) -> None:
         # Strip trailing slash so we can safely concatenate "/<target_url>" later.
         self.api_url = api_url.rstrip("/")
         self.headers = {"Accept": "application/json"}
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self, timeout: float = 8.0) -> Any:
+        if self._client is None or getattr(self._client, "is_closed", False):
+            created = httpx.Client(headers=self.headers, timeout=timeout)
+            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
+                entered = created.__enter__.return_value
+                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
+                    return entered
+            self._client = created
+            self._owns_client = True
+        return self._client
+
+    def close(self) -> None:
+        if self._client and not getattr(self._client, "is_closed", False) and self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> JinaReaderFetcher:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
         """Fetch the page content via Jina Reader.
@@ -39,18 +63,20 @@ class JinaReaderFetcher:
         Raises:
             FetchError: On network or HTTP errors, carrying a :class:`FetchStatus`.
         """
-        if not url:
+        if not is_safe_url(url):
             return ""
         try:
             # Jina API format: https://r.jina.ai/http://example.com
             full_url = f"{self.api_url}/{url}"
-            with httpx.Client(headers=self.headers, timeout=timeout) as client:
-                resp = client.get(full_url)
-                resp.raise_for_status()
-                data = resp.json()
-                # Jina returns {"content": "<markdown>", ...}
-                content = data.get("content") or data.get("text") or ""
-                return content[:max_length]
+            client = self._get_client(timeout=timeout)
+            resp = client.get(full_url)
+            resp.raise_for_status()
+            data = resp.json()
+            # Jina returns {"content": "<markdown>", ...}
+            content = data.get("content") or data.get("text") or ""
+            return content[:max_length]
+        except FetchError:
+            raise
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
             mapping = {

@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--model", help="使用するLLMモデル名")
     parser.add_argument("--base-url", help="OpenAI互換APIのエンドポイントURL")
-    parser.add_argument("--api-key", help="APIキー")
+    parser.add_argument("--api-key", help="APIキー（非推奨: セキュリティのため環境変数 SEARCH_API_KEY の使用を推奨）")
     parser.add_argument("--max-concurrency", type=int, help="並列実行数の上限")
     parser.add_argument("--max-search-queries", type=int, help="最大検索クエリ数")
     parser.add_argument("--max-search-rounds", type=int, help="最大検索ラウンド数")
@@ -58,6 +58,11 @@ def main(argv: list[str] | None = None) -> None:
     verbosity_group.add_argument("-q", "--quiet", action="store_true", help="進捗表示を抑制し結果のみ出力")
     args = parser.parse_args(argv)
 
+    if args.api_key:
+        sys.stderr.write(
+            "警告: コマンドライン引数 '--api-key' の使用はプロセス一覧等に平文で残るリスクがあります。"
+            "環境変数 SEARCH_API_KEY の使用を推奨します。\n"
+        )
     if args.max_concurrency is not None and args.max_concurrency < 1:
         parser.error("--max-concurrency は1以上を指定してください")
     if args.max_search_queries is not None and args.max_search_queries < 1:

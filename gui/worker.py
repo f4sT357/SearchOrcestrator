@@ -1,4 +1,4 @@
-"""Background worker thread for running the research workflow."""
+"""Background worker thread and task runners for running the research workflow."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import sys
 import os
 from typing import Any
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal
 
 # Ensure parent directory is in sys.path when running from gui/
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -14,7 +14,7 @@ parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from search_orchestrator import Settings, create_workflow, preload_reranker
+from search_orchestrator import Settings, create_workflow, preload_reranker, fetch_available_models
 
 
 class RerankerPreloadSignals(QObject):
@@ -22,14 +22,69 @@ class RerankerPreloadSignals(QObject):
     failed = Signal(str)
 
 
+class RerankerPreloadRunnable(QRunnable):
+    """QRunnable task to warm the reranker cache via QThreadPool."""
+
+    def __init__(self, model_name: str) -> None:
+        super().__init__()
+        self.signals = RerankerPreloadSignals()
+        self.model_name = model_name
+
+    def run(self) -> None:
+        try:
+            preload_reranker(self.model_name)
+        except Exception as exc:
+            try:
+                self.signals.failed.emit(str(exc))
+            except RuntimeError:
+                pass
+        else:
+            try:
+                self.signals.ready.emit()
+            except RuntimeError:
+                pass
+
+
 def preload_reranker_background(model_name: str, signals: RerankerPreloadSignals) -> None:
-    """Warm the reranker cache without blocking the GUI event loop."""
-    try:
-        preload_reranker(model_name)
-    except Exception as exc:
-        signals.failed.emit(str(exc))
-    else:
-        signals.ready.emit()
+    """Warm the reranker cache using QThreadPool without blocking the GUI event loop."""
+    runnable = RerankerPreloadRunnable(model_name)
+    runnable.signals.ready.connect(signals.ready.emit)
+    runnable.signals.failed.connect(signals.failed.emit)
+    QThreadPool.globalInstance().start(runnable)
+
+
+class ModelFetchSignals(QObject):
+    models_fetched = Signal(list, bool)
+    fetch_failed = Signal(str, bool)
+
+
+class ModelFetchRunnable(QRunnable):
+    """QRunnable task to query available models asynchronously via QThreadPool."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        show_feedback: bool = False,
+    ) -> None:
+        super().__init__()
+        self.signals = ModelFetchSignals()
+        self.base_url = base_url
+        self.api_key = api_key
+        self.show_feedback = show_feedback
+
+    def run(self) -> None:
+        try:
+            models = fetch_available_models(base_url=self.base_url, api_key=self.api_key, timeout=3.0)
+            try:
+                self.signals.models_fetched.emit(models, self.show_feedback)
+            except RuntimeError:
+                pass
+        except Exception as exc:
+            try:
+                self.signals.fetch_failed.emit(str(exc), self.show_feedback)
+            except RuntimeError:
+                pass
 
 
 def _fetch_settings_summary(settings: Settings) -> str:

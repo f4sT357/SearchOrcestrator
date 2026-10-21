@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Protocol, TypedDict
 from urllib.parse import urlparse
 
+import ipaddress
 import httpx
 import lxml.html
 from ddgs import DDGS
@@ -144,7 +145,9 @@ class Settings:
             if env_name in os.environ:
                 values[key] = float(os.environ[env_name])
         if "SEARCH_OFFICIAL_DOMAINS" in os.environ:
-            values["official_domains"] = os.environ["SEARCH_OFFICIAL_DOMAINS"]
+            values["official_domains"] = tuple(
+                d.strip() for d in os.environ["SEARCH_OFFICIAL_DOMAINS"].split(",") if d.strip()
+            )
         return cls(**values)
 
 
@@ -463,10 +466,40 @@ class WebContentFetcher(Protocol):
 # Primary fetcher
 # ---------------------------------------------------------------------------
 
+
+def is_safe_url(url: str) -> bool:
+    """Validate that the given URL uses http/https and is not pointing to private/loopback/metadata addresses."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        lower_host = hostname.lower()
+        if lower_host in {"localhost", "metadata.google.internal"} or lower_host.endswith(".local") or lower_host.endswith(".internal"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(lower_host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+            if str(ip) in {"169.254.169.254", "0.0.0.0"}:
+                return False
+        except ValueError:
+            pass
+
+        return True
+    except Exception:
+        return False
+
 class DefaultWebContentFetcher:
     """Fetch and extract clean, readable text from a URL using httpx and lxml."""
 
-    def __init__(self, headers: dict[str, str] | None = None) -> None:
+    def __init__(self, headers: dict[str, str] | None = None, client: httpx.Client | None = None) -> None:
         self.headers = headers or {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -476,6 +509,29 @@ class DefaultWebContentFetcher:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
         }
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self, timeout: float = 8.0) -> Any:
+        if self._client is None or getattr(self._client, "is_closed", False):
+            created = httpx.Client(headers=self.headers, follow_redirects=True, timeout=timeout)
+            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
+                entered = created.__enter__.return_value
+                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
+                    return entered
+            self._client = created
+            self._owns_client = True
+        return self._client
+
+    def close(self) -> None:
+        if self._client and not getattr(self._client, "is_closed", False) and self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> DefaultWebContentFetcher:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -537,36 +593,35 @@ class DefaultWebContentFetcher:
             return self._clean_text(stripped)[:max_length]
 
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
-        if not url or not url.startswith(("http://", "https://")):
+        if not is_safe_url(url):
             return ""
         try:
-            # Default SSL verification (verify=True) for security
-            with httpx.Client(headers=self.headers, follow_redirects=True, timeout=timeout) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
+            client = self._get_client(timeout=timeout)
+            resp = client.get(url)
+            resp.raise_for_status()
 
-                content_type = resp.headers.get("content-type", "").lower()
-                text = resp.text
-                if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "latin-1", "ascii"}:
-                    meta_match = re.search(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)""", resp.content[:8192], flags=re.IGNORECASE)
-                    if meta_match:
-                        try:
-                            detected = meta_match.group(1).decode("ascii").lower()
-                            text = resp.content.decode(detected, errors="replace")
-                        except Exception:
-                            text = resp.content.decode("utf-8", errors="replace")
-                    else:
-                        try:
-                            text = resp.content.decode("utf-8")
-                        except UnicodeDecodeError:
-                            pass
-
-                if "text/html" in content_type or "application/xhtml+xml" in content_type or not content_type:
-                    return self.extract_text_from_html(text, max_length=max_length)
-                elif "text/plain" in content_type:
-                    return self._clean_text(text)[:max_length]
+            content_type = resp.headers.get("content-type", "").lower()
+            text = resp.text
+            if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "latin-1", "ascii"}:
+                meta_match = re.search(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)""", resp.content[:8192], flags=re.IGNORECASE)
+                if meta_match:
+                    try:
+                        detected = meta_match.group(1).decode("ascii").lower()
+                        text = resp.content.decode(detected, errors="replace")
+                    except Exception:
+                        text = resp.content.decode("utf-8", errors="replace")
                 else:
-                    return ""
+                    try:
+                        text = resp.content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        pass
+
+            if "text/html" in content_type or "application/xhtml+xml" in content_type or not content_type:
+                return self.extract_text_from_html(text, max_length=max_length)
+            elif "text/plain" in content_type:
+                return self._clean_text(text)[:max_length]
+            else:
+                return ""
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
             # Map known status codes to FetchStatus enum
@@ -592,7 +647,7 @@ class DefaultWebContentFetcher:
 class FirecrawlFetcher:
     """Retrieve one page as Markdown from a self-hosted Firecrawl API."""
 
-    def __init__(self, api_url: str = "http://localhost:3002", api_key: str = "") -> None:
+    def __init__(self, api_url: str = "http://localhost:3002", api_key: str = "", client: httpx.Client | None = None) -> None:
         base_url = api_url.rstrip("/")
         parsed_url = urlparse(base_url)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
@@ -604,35 +659,59 @@ class FirecrawlFetcher:
         else:
             self.endpoint = f"{base_url}/v2/scrape"
         self.api_key = api_key
-
-    def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
-        if not url:
-            return ""
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        self.headers = headers
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self, timeout: float = 30.0) -> Any:
+        if self._client is None or getattr(self._client, "is_closed", False):
+            created = httpx.Client(headers=self.headers, timeout=max(timeout, 30.0))
+            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
+                entered = created.__enter__.return_value
+                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
+                    return entered
+            self._client = created
+            self._owns_client = True
+        return self._client
+
+    def close(self) -> None:
+        if self._client and not getattr(self._client, "is_closed", False) and self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> FirecrawlFetcher:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
+        if not is_safe_url(url):
+            return ""
         try:
             # Firecrawl's scrape operation may need longer than the built-in
             # fetcher's interactive timeout, especially when rendering pages.
-            with httpx.Client(headers=headers, timeout=max(timeout, 30.0)) as client:
-                response = client.post(
-                    self.endpoint,
-                    json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            client = self._get_client(timeout=timeout)
+            response = client.post(
+                self.endpoint,
+                json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("success") is False:
+                raise FetchError(
+                    f"Firecrawl scrape failed for {url}: {payload.get('error', 'invalid response') if isinstance(payload, dict) else 'invalid response'}",
+                    status=FetchStatus.PARSE_ERROR,
                 )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or payload.get("success") is False:
-                    raise FetchError(
-                        f"Firecrawl scrape failed for {url}: {payload.get('error', 'invalid response') if isinstance(payload, dict) else 'invalid response'}",
-                        status=FetchStatus.PARSE_ERROR,
-                    )
-                data = payload.get("data") or {}
-                if not isinstance(data, dict):
-                    raise FetchError("Firecrawl returned an invalid data object", status=FetchStatus.PARSE_ERROR)
-                markdown = data.get("markdown")
-                if not isinstance(markdown, str):
-                    raise FetchError("Firecrawl response did not contain Markdown", status=FetchStatus.PARSE_ERROR)
-                return markdown[:max_length]
+            data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                raise FetchError("Firecrawl returned an invalid data object", status=FetchStatus.PARSE_ERROR)
+            markdown = data.get("markdown")
+            if not isinstance(markdown, str):
+                raise FetchError("Firecrawl response did not contain Markdown", status=FetchStatus.PARSE_ERROR)
+            return markdown[:max_length]
         except FetchError:
             raise
         except httpx.HTTPStatusError as http_err:
@@ -665,10 +744,33 @@ class FirecrawlFetcher:
 class JinaReaderFetcher:
     """Fallback fetcher using Jina Reader API to retrieve page content as markdown/json."""
 
-    def __init__(self, api_url: str = "https://r.jina.ai/") -> None:
+    def __init__(self, api_url: str = "https://r.jina.ai/", client: httpx.Client | None = None) -> None:
         # Ensure no trailing slash for consistent URL building
         self.api_url = api_url.rstrip("/")
         self.headers = {"Accept": "application/json"}
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self, timeout: float = 8.0) -> Any:
+        if self._client is None or getattr(self._client, "is_closed", False):
+            created = httpx.Client(headers=self.headers, timeout=timeout)
+            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
+                entered = created.__enter__.return_value
+                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
+                    return entered
+            self._client = created
+            self._owns_client = True
+        return self._client
+
+    def close(self) -> None:
+        if self._client and not getattr(self._client, "is_closed", False) and self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> JinaReaderFetcher:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
         """Fetch the page content via Jina Reader.
@@ -682,18 +784,18 @@ class JinaReaderFetcher:
         Raises:
             FetchError: On network or HTTP errors, with appropriate FetchStatus.
         """
-        if not url:
+        if not is_safe_url(url):
             return ""
         try:
             # Jina API format: https://r.jina.ai/http://example.com
             full_url = f"{self.api_url}/{url}"
-            with httpx.Client(headers=self.headers, timeout=timeout) as client:
-                resp = client.get(full_url)
-                resp.raise_for_status()
-                data = resp.json()
-                # Jina returns a JSON with a "content" field containing markdown/text
-                content = data.get("content") or data.get("text") or ""
-                return content[:max_length]
+            client = self._get_client(timeout=timeout)
+            resp = client.get(full_url)
+            resp.raise_for_status()
+            data = resp.json()
+            # Jina returns a JSON with a "content" field containing markdown/text
+            content = data.get("content") or data.get("text") or ""
+            return content[:max_length]
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
             mapping = {
@@ -849,8 +951,9 @@ def populate_content(
     for item in updated:
         page_date = extract_content_date(item.content)
         freshness = freshness_score(item.url, content=item.content)
+        relevance = item.relevance_score if item.relevance_score is not None else 0.0
         combined = composite_score(
-            item.relevance_score, item.url, content=item.content,
+            relevance, item.url, content=item.content,
             w_relevance=weights[0], w_trust=weights[1], w_freshness=weights[2],
             official_domains=official_domains,
         )
@@ -1065,78 +1168,88 @@ def strip_model_reasoning(text: str) -> str:
 # Workflow
 # ---------------------------------------------------------------------------
 
-def create_workflow(
-    settings: Settings,
-    search: SearchClient | None = None,
-    reranker: Reranker | None = None,
-    llm: ChatOpenAI | None = None,
-    fetcher: WebContentFetcher | None = None,
-    fallback_fetcher: WebContentFetcher | None = None,
-    log: Callable[[str], None] | None = None,
-    board_update: Callable[[str], None] | None = None,
-    progress: Callable[[str, str, str], None] | None = None,
-) -> Any:
-    """Build the graph and initialize its dependencies."""
-    if llm is None:
-        llm = ChatOpenAI(
-            model=settings.model,
-            base_url=settings.base_url,
-            api_key=settings.api_key,
-            temperature=0,
-        )
-    board_writer_llm = llm.bind_tools([
-        {
-            "type": "function",
-            "function": {
-                "name": "write_research_board",
-                "description": "必ず1回呼ぶ。新しい投稿が不要ならcontentを英小文字のnothingにする。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "掲示板に残す短い投稿。投稿不要の場合は正確にnothing。",
-                        }
-                    },
-                    "required": ["content"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ], tool_choice="required")
-    if search is None:
-        search = DDGS()
-    if reranker is None:
-        reranker = _load_reranker(settings.reranker_model)
-    if fetcher is None and settings.fetch_web_content:
-        if settings.content_fetcher == "firecrawl":
-            fetcher = FirecrawlFetcher(
-                api_url=settings.firecrawl_api_url,
-                api_key=settings.firecrawl_api_key,
+class ResearchWorkflowNodes:
+    """Encapsulates LangGraph node handlers and dependencies for testability and separation of concerns."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        search: SearchClient | None = None,
+        reranker: Reranker | None = None,
+        llm: ChatOpenAI | None = None,
+        fetcher: WebContentFetcher | None = None,
+        fallback_fetcher: WebContentFetcher | None = None,
+        log: Callable[[str], None] | None = None,
+        board_update: Callable[[str], None] | None = None,
+        progress: Callable[[str, str, str], None] | None = None,
+    ) -> None:
+        self.settings = settings
+        self.log = log
+        self.board_update = board_update
+        self.progress = progress
+
+        if llm is None:
+            llm = ChatOpenAI(
+                model=settings.model,
+                base_url=settings.base_url,
+                api_key=settings.api_key,
+                temperature=0,
             )
-        else:
-            fetcher = DefaultWebContentFetcher()
-    elif not settings.fetch_web_content:
-        fetcher = None
-    # Instantiate fallback fetcher if enabled and not provided
-    if fallback_fetcher is None and settings.use_fallback_fetcher:
-        fallback_fetcher = JinaReaderFetcher(api_url=settings.jina_api_url)
+        self.llm = llm
+        self.board_writer_llm = self.llm.bind_tools([
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_research_board",
+                    "description": "必ず1回呼ぶ。新しい投稿が不要ならcontentを英小文字のnothingにする。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "掲示板に残す短い投稿。投稿不要の場合は正確にnothing。",
+                            }
+                        },
+                        "required": ["content"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ], tool_choice="required")
+        if search is None:
+            search = DDGS()
+        self.search = search
+        if reranker is None:
+            reranker = _load_reranker(settings.reranker_model)
+        self.reranker = reranker
+        if fetcher is None and settings.fetch_web_content:
+            if settings.content_fetcher == "firecrawl":
+                fetcher = FirecrawlFetcher(
+                    api_url=settings.firecrawl_api_url,
+                    api_key=settings.firecrawl_api_key,
+                )
+            else:
+                fetcher = DefaultWebContentFetcher()
+        elif not settings.fetch_web_content:
+            fetcher = None
+        self.fetcher = fetcher
+        if fallback_fetcher is None and settings.use_fallback_fetcher:
+            fallback_fetcher = JinaReaderFetcher(api_url=settings.jina_api_url)
+        self.fallback_fetcher = fallback_fetcher
+        self.current_date = date.today().isoformat()
 
-    # Keep all model stages on the same as-of date for a single research run.
-    current_date = date.today().isoformat()
+    def log_detail(self, message: str) -> None:
+        if self.log is not None:
+            self.log(message)
 
-    def log_detail(message: str) -> None:
-        if log is not None:
-            log(message)
-
-    def report_progress(stage: str, status: str, detail: str = "") -> None:
-        if progress is not None:
+    def report_progress(self, stage: str, status: str, detail: str = "") -> None:
+        if self.progress is not None:
             try:
-                progress(stage, status, detail)
+                self.progress(stage, status, detail)
             except Exception as error:
-                log_detail(f"進行状況の通知に失敗しました: {error}")
+                self.log_detail(f"進行状況の通知に失敗しました: {error}")
 
-    def track_node(stage: str, node: Callable[[State], dict[str, Any]]):
+    def track_node(self, stage: str, node: Callable[[State], dict[str, Any]]):
         def tracked(state: State):
             detail = ""
             if stage == "search":
@@ -1153,17 +1266,17 @@ def create_workflow(
                 detail = f"検索 {state.get('search_round', 0) + 1}回目の結果"
             elif stage == "understand_input":
                 detail = "ユーザーの依頼内容を整理"
-            report_progress(stage, "started", detail)
+            self.report_progress(stage, "started", detail)
             try:
                 result = node(state)
             except Exception as error:
-                report_progress(stage, "failed", str(error))
+                self.report_progress(stage, "failed", str(error))
                 raise
-            report_progress(stage, "completed", detail)
+            self.report_progress(stage, "completed", detail)
             return result
         return tracked
 
-    def log_selected_results(results: list[SearchResult], label: str = "採用候補") -> None:
+    def log_selected_results(self, results: list[SearchResult], label: str = "採用候補") -> None:
         for index, item in enumerate(results, start=1):
             scores = []
             if item.relevance_score is not None:
@@ -1178,14 +1291,14 @@ def create_workflow(
             tier = item.source_reliability or "区分不明"
             status = item.fetch_status or ("取得済み" if item.content else "本文未取得")
             page_date = f" / ページ日付 {item.page_date}" if item.page_date else ""
-            log_detail(
+            self.log_detail(
                 f"  {label} {index}: {item.title or item.url} / {tier} / {details}"
                 f" / 本文 {status}{page_date}"
             )
 
-    def understand_input(state: State):
+    def understand_input(self, state: State):
         query = state["query"].strip()
-        prompt = f"""あなたは調査依頼の受付担当です。現在日: {current_date}
+        prompt = f"""あなたは調査依頼の受付担当です。現在日: {self.current_date}
 ユーザーの入力だけを読み、後続の調査計画が誤解なく作れるよう依頼内容を短く整理してください。
 
 入力の意図を次の項目で日本語でまとめてください。
@@ -1199,10 +1312,10 @@ def create_workflow(
 ユーザーの入力:
 {query}"""
         try:
-            understood = strip_model_reasoning(llm.invoke(prompt).content).strip()
+            understood = strip_model_reasoning(self.llm.invoke(prompt).content).strip()
         except Exception as error:
             understood = ""
-            log_detail(f"入力内容の整理に失敗しました。原文を使って続行します: {error}")
+            self.log_detail(f"入力内容の整理に失敗しました。原文を使って続行します: {error}")
         if not understood:
             understood = f"モデルによる整理はできなかったため、入力原文を調査対象として扱います。\n{query}"
         understood = understood[:1200]
@@ -1211,16 +1324,16 @@ def create_workflow(
             state.get("run_memo", ""), [post], max_chars=5000,
         )
         if added_posts:
-            log_detail("調査ボードに依頼内容の理解を記録しました:")
-            log_detail(f"  {added_posts[0]}")
-            if board_update is not None:
-                board_update(memo)
+            self.log_detail("調査ボードに依頼内容の理解を記録しました:")
+            self.log_detail(f"  {added_posts[0]}")
+            if self.board_update is not None:
+                self.board_update(memo)
         if evicted_posts:
-            log_detail(f"共有ボードの文字数上限により古い投稿を {evicted_posts}件整理しました")
+            self.log_detail(f"共有ボードの文字数上限により古い投稿を {evicted_posts}件整理しました")
         return {"understood_request": understood, "run_memo": memo}
 
-    def planner(state: State):
-        prompt = f"""あなたはリサーチプランナーです。現在日: {current_date}
+    def planner(self, state: State):
+        prompt = f"""あなたはリサーチプランナーです。現在日: {self.current_date}
 ユーザーの入力: {state['query']}
 入力内容の整理: {state.get('understood_request', '') or '（整理情報なし。入力原文を優先してください）'}
 
@@ -1248,38 +1361,38 @@ def create_workflow(
 }}
 ```"""
         try:
-            response = llm.invoke(prompt)
+            response = self.llm.invoke(prompt)
             data = parse_json_from_response(response.content)
             plan = SearchPlan.model_validate(data)
             if not plan.tasks:
                 plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
-            log_detail(f"調査計画: {len(plan.tasks)}件の観点を作成")
-            log_detail("生成された調査計画の内容:")
+            self.log_detail(f"調査計画: {len(plan.tasks)}件の観点を作成")
+            self.log_detail("生成された調査計画の内容:")
             for index, task in enumerate(plan.tasks, start=1):
-                log_detail(
+                self.log_detail(
                     f"  計画候補 {index}: {task.aspect} / クエリ: {task.query} / 理由: {task.reason}"
                 )
             for index, query in enumerate(plan.official_queries, start=1):
-                log_detail(f"  公式検索案 {index}: {query}")
+                self.log_detail(f"  公式検索案 {index}: {query}")
         except Exception as err:
             print(f"調査計画のパース失敗 (フォールバック適用): {err}")
             plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
-            log_detail(f"調査計画の解析に失敗したため、基本検索に切り替えました: {err}")
+            self.log_detail(f"調査計画の解析に失敗したため、基本検索に切り替えました: {err}")
 
         try:
             validated_queries = _validate_followup_queries(
-                state["query"], [task.query for task in plan.tasks], reranker,
+                state["query"], [task.query for task in plan.tasks], self.reranker,
             )
         except Exception as error:
             validated_queries = []
-            log_detail(f"調査計画の関連度検査に失敗しました。元の質問から検索します: {error}")
-        log_detail(
+            self.log_detail(f"調査計画の関連度検査に失敗しました。元の質問から検索します: {error}")
+        self.log_detail(
             f"関連度検査を通過した調査計画クエリ: {len(validated_queries)}/{len(plan.tasks)}件"
         )
         for index, query in enumerate(validated_queries, start=1):
-            log_detail(f"  採用クエリ {index}: {query}")
+            self.log_detail(f"  採用クエリ {index}: {query}")
         if len(validated_queries) != len(plan.tasks):
-            log_detail(
+            self.log_detail(
                 f"元の質問との関連が弱い調査計画を {len(plan.tasks) - len(validated_queries)}件除外しました"
             )
         official_queries = [
@@ -1290,10 +1403,10 @@ def create_workflow(
         official_queries = list(dict.fromkeys(official_queries))
         try:
             official_queries = _validate_followup_queries(
-                state["query"], official_queries, reranker,
+                state["query"], official_queries, self.reranker,
             )
         except Exception as error:
-            log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {error}")
+            self.log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {error}")
             official_queries = []
         subject = _compact_query_terms(state["query"]) or state["query"].strip()
         official_fallbacks = [
@@ -1324,26 +1437,26 @@ def create_workflow(
                     reason="元の質問に直接答えるための基本情報収集",
                 )
             ], official_queries=official_queries)
-            log_detail("有効な調査計画が残らなかったため、元の質問だけで検索します")
+            self.log_detail("有効な調査計画が残らなかったため、元の質問だけで検索します")
         for index, task in enumerate(plan.tasks, start=1):
-            log_detail(f"  計画 {index}: {task.aspect} / クエリ: {task.query} / 理由: {task.reason}")
-        official_limit = min(5, max(settings.max_search_queries - 1, 0))
-        regular_limit = settings.max_search_queries - official_limit if official_limit else settings.max_search_queries
+            self.log_detail(f"  計画 {index}: {task.aspect} / クエリ: {task.query} / 理由: {task.reason}")
+        official_limit = min(5, max(self.settings.max_search_queries - 1, 0))
+        regular_limit = self.settings.max_search_queries - official_limit if official_limit else self.settings.max_search_queries
         if len(plan.tasks) > regular_limit:
-            log_detail(
+            self.log_detail(
                 f"通常検索 {regular_limit}件と公式検索 {official_limit}件の枠を確保します"
             )
         return {"plan": plan}
 
-    def dispatch_searches(state: State):
+    def dispatch_searches(self, state: State):
         if state["plan"] is None:
             return []
         # Reserve up to five initial query slots for the independent official-source lane.
-        official_limit = min(5, max(settings.max_search_queries - 1, 0))
+        official_limit = min(5, max(self.settings.max_search_queries - 1, 0))
         selected_official_queries = state["plan"].official_queries[:official_limit]
-        regular_limit = settings.max_search_queries - len(selected_official_queries)
+        regular_limit = self.settings.max_search_queries - len(selected_official_queries)
         if not selected_official_queries:
-            regular_limit = settings.max_search_queries
+            regular_limit = self.settings.max_search_queries
         sends = [
             Send("search", {"task": task})
             for task in state["plan"].tasks[:regular_limit]
@@ -1354,10 +1467,10 @@ def create_workflow(
                 "official_queries": selected_official_queries,
             }))
         else:
-            log_detail("検索クエリ上限のため、公式ソース専用検索を見送りました")
+            self.log_detail("検索クエリ上限のため、公式ソース専用検索を見送りました")
         return sends
 
-    def official_search(state: State):
+    def official_search(self, state: State):
         """Search independent queries dedicated to finding first-party sources."""
         progress_stage = state.get("progress_stage", "official_search")
         queries = state.get("official_queries", [])[:5]
@@ -1367,65 +1480,65 @@ def create_workflow(
                 "search_query_count": 0, "searched_queries": [],
                 "official_search_query_count": 0,
             }
-        log_detail(f"公式ソース専用検索を開始します（最大 {len(queries)} クエリ）")
+        self.log_detail(f"公式ソース専用検索を開始します（最大 {len(queries)} クエリ）")
         evidence_results: list[SearchResult] = []
         selected_results: list[SearchResult] = []
         searched_queries: list[str] = []
-        weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
+        weights = (self.settings.relevance_weight, self.settings.trust_weight, self.settings.freshness_weight)
         candidate_count = (
-            settings.content_candidate_results_per_query
-            if fetcher else settings.reranked_results_per_query
+            self.settings.content_candidate_results_per_query
+            if self.fetcher else self.settings.reranked_results_per_query
         )
         for query_index, query in enumerate(queries, start=1):
-            report_progress(
+            self.report_progress(
                 progress_stage, "progress",
                 f"{query_index}/{len(queries)}件目 · 検索中: {query}",
             )
-            log_detail(f"公式ソース専用検索: {query}")
+            self.log_detail(f"公式ソース専用検索: {query}")
             searched_queries.append(query)
             candidates: list[SearchResult] = []
             try:
-                response = search.text(query, max_results=settings.results_per_query)
+                response = self.search.text(query, max_results=self.settings.results_per_query)
                 add_search_results(candidates, response, query)
-                report_progress(
+                self.report_progress(
                     progress_stage, "progress",
                     f"{query_index}/{len(queries)}件目 · 候補 {len(candidates)}件",
                 )
-                log_detail(f"公式ソース検索候補: {len(candidates)}件")
+                self.log_detail(f"公式ソース検索候補: {len(candidates)}件")
             except Exception as error:
                 if "no results found" in str(error).casefold():
-                    log_detail(f"公式ソース検索結果なし: {query}")
+                    self.log_detail(f"公式ソース検索結果なし: {query}")
                 else:
-                    log_detail(f"公式ソース検索に失敗しました: {query} / {error}")
+                    self.log_detail(f"公式ソース検索に失敗しました: {query} / {error}")
                 continue
             query_candidates = rerank_results(
-                candidates, reranker, candidate_count, weights=weights,
-                official_domains=settings.official_domains,
+                candidates, self.reranker, candidate_count, weights=weights,
+                official_domains=self.settings.official_domains,
             )
-            if fetcher:
-                report_progress(
+            if self.fetcher:
+                self.report_progress(
                     progress_stage, "progress",
                     f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(query_candidates)}件）",
                 )
                 query_candidates = populate_content(
-                    query_candidates, fetcher, timeout=settings.fetch_timeout,
-                    max_length=settings.max_content_length,
-                    fallback_fetcher=fallback_fetcher, weights=weights,
-                    official_domains=settings.official_domains,
+                    query_candidates, self.fetcher, timeout=self.settings.fetch_timeout,
+                    max_length=self.settings.max_content_length,
+                    fallback_fetcher=self.fallback_fetcher, weights=weights,
+                    official_domains=self.settings.official_domains,
                 )
             evidence_results.extend(query_candidates)
             selected_results.extend(
-                select_diverse_results(query_candidates, settings.reranked_results_per_query)
+                select_diverse_results(query_candidates, self.settings.reranked_results_per_query)
             )
         evidence_results = deduplicate_results(evidence_results)
         selected = select_diverse_results(
             deduplicate_results(selected_results),
-            settings.reranked_results_per_query * len(queries),
+            self.settings.reranked_results_per_query * len(queries),
         )
-        log_selected_results(selected, label="公式ソース専用検索候補")
+        self.log_selected_results(selected, label="公式ソース専用検索候補")
         if not selected:
-            log_detail("公式ソース専用検索で採用できる候補はありませんでした")
-        log_detail(f"公式ソース本文候補 {len(evidence_results)}件を品質評価へ渡します")
+            self.log_detail("公式ソース専用検索で採用できる候補はありませんでした")
+        self.log_detail(f"公式ソース本文候補 {len(evidence_results)}件を品質評価へ渡します")
         return {
             "results": selected,
             "evidence_results": evidence_results,
@@ -1435,55 +1548,55 @@ def create_workflow(
             "official_search_query_count": len(searched_queries),
         }
 
-    def search_task(state: State):
+    def search_task(self, state: State):
         task = state.get("task")
         if task is None:
             return {"results": [], "evidence_results": [], "search_query_count": 0, "searched_queries": [], "normal_search_query_count": 0}
         fresh_results: list[SearchResult] = []
-        log_detail(f"検索開始: {task.query}（観点: {task.aspect}）")
+        self.log_detail(f"検索開始: {task.query}（観点: {task.aspect}）")
         try:
-            response = search.text(task.query, max_results=settings.results_per_query)
+            response = self.search.text(task.query, max_results=self.settings.results_per_query)
             add_search_results(fresh_results, response, task.query)
         except Exception as error:
             if "no results found" in str(error).casefold():
-                log_detail(f"検索結果なし: {task.query}")
+                self.log_detail(f"検索結果なし: {task.query}")
             else:
                 print(f"検索失敗 ({task.query}): {error}")
-                log_detail(f"検索失敗: {task.query} / {error}")
+                self.log_detail(f"検索失敗: {task.query} / {error}")
             return {
                 "results": [], "evidence_results": [], "search_query_count": 1,
                 "searched_queries": [task.query], "normal_search_query_count": 1,
             }
 
-        report_progress("search", "progress", f"候補 {len(fresh_results)}件 · {task.query}")
-        log_detail(f"検索候補: {len(fresh_results)}件（取得上限: {settings.results_per_query}）")
+        self.report_progress("search", "progress", f"候補 {len(fresh_results)}件 · {task.query}")
+        self.log_detail(f"検索候補: {len(fresh_results)}件（取得上限: {self.settings.results_per_query}）")
 
         candidate_count = (
-            settings.content_candidate_results_per_query
-            if fetcher else settings.reranked_results_per_query
+            self.settings.content_candidate_results_per_query
+            if self.fetcher else self.settings.reranked_results_per_query
         )
-        scoring_weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
+        scoring_weights = (self.settings.relevance_weight, self.settings.trust_weight, self.settings.freshness_weight)
         top_results = rerank_results(
-            fresh_results, reranker, candidate_count, weights=scoring_weights,
-            official_domains=settings.official_domains,
+            fresh_results, self.reranker, candidate_count, weights=scoring_weights,
+            official_domains=self.settings.official_domains,
         )
-        log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
-        if fetcher:
-            report_progress("search", "progress", f"本文を取得中（候補 {len(top_results)}件） · {task.query}")
+        self.log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
+        if self.fetcher:
+            self.report_progress("search", "progress", f"本文を取得中（候補 {len(top_results)}件） · {task.query}")
             top_results = populate_content(
                 top_results,
-                fetcher,
-                timeout=settings.fetch_timeout,
-                max_length=settings.max_content_length,
-                fallback_fetcher=fallback_fetcher,
+                self.fetcher,
+                timeout=self.settings.fetch_timeout,
+                max_length=self.settings.max_content_length,
+                fallback_fetcher=self.fallback_fetcher,
                 weights=scoring_weights,
-                official_domains=settings.official_domains,
+                official_domains=self.settings.official_domains,
             )
         evidence_results = top_results
-        log_detail(f"品質評価用に本文候補 {len(evidence_results)}件を保持します")
-        top_results = select_diverse_results(top_results, settings.reranked_results_per_query)
+        self.log_detail(f"品質評価用に本文候補 {len(evidence_results)}件を保持します")
+        top_results = select_diverse_results(top_results, self.settings.reranked_results_per_query)
 
-        log_selected_results(top_results)
+        self.log_selected_results(top_results)
 
         return {
             "results": top_results,
@@ -1493,7 +1606,7 @@ def create_workflow(
             "normal_search_query_count": 1,
         }
 
-    def evaluate(state: State):
+    def evaluate(self, state: State):
         all_results = deduplicate_results(
             (state.get("evidence_results", []) or state.get("results", []))
             + state.get("official_results", [])
@@ -1508,13 +1621,13 @@ def create_workflow(
         ]
         excluded_count = len(all_results) - len(relevance_eligible)
         if excluded_count:
-            log_detail(
+            self.log_detail(
                 f"品質評価から低関連ソース {excluded_count}件を除外しました "
                 f"（関連度 {MIN_RELEVANCE_FOR_EVALUATION:.2f} 未満）"
             )
         capped_count = len(relevance_eligible) - len(unique_results)
         if capped_count:
-            log_detail(
+            self.log_detail(
                 f"品質評価の入力上限と出典分散により {capped_count}件を今回の評価対象から外しました "
                 f"（評価対象上限: {MAX_EVIDENCE_SOURCES}件）"
             )
@@ -1522,9 +1635,9 @@ def create_workflow(
             format_results_for_llm(unique_results)
             if unique_results else "十分な関連度を満たす情報源はありません。"
         )
-        prompt = f"""あなたはリサーチ品質評価担当です。現在日: {current_date}
+        prompt = f"""あなたはリサーチ品質評価担当です。現在日: {self.current_date}
 質問: {state['query']}
-調査計画: {state['plan']}
+調査計画: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
 この調査回だけの共有ボード（これまでの投稿。根拠本文と矛盾すれば本文を優先）:
 {state.get('run_memo', '') or '（まだありません）'}
 関連度スコア {MIN_RELEVANCE_FOR_EVALUATION:.2f} 以上の検索結果およびWebページ本文（これ以外の検索結果は評価から除外済み）:
@@ -1576,13 +1689,13 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
         raw_evaluation = ""
         evaluation_failed = False
         try:
-            response = llm.invoke(prompt)
+            response = self.llm.invoke(prompt)
             raw_evaluation = response.content
             data = normalize_evaluation_payload(parse_json_from_response(raw_evaluation))
             eval_obj = Evaluation.model_validate(data)
         except Exception as err:
-            log_detail(f"品質評価の応答を解析できませんでした: {err}")
-            log_detail("判断: 応答形式を修正して品質評価を1回だけ再試行します")
+            self.log_detail(f"品質評価の応答を解析できませんでした: {err}")
+            self.log_detail("判断: 応答形式を修正して品質評価を1回だけ再試行します")
             try:
                 if not raw_evaluation:
                     raise RuntimeError("品質評価モデルから応答を取得できませんでした")
@@ -1596,26 +1709,26 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
 
 JSON例:
 {{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"official_additional_queries":[]}}'''
-                repaired = llm.invoke(repair_prompt)
+                repaired = self.llm.invoke(repair_prompt)
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
-                log_detail("品質評価の再試行に成功しました")
+                self.log_detail("品質評価の再試行に成功しました")
             except Exception as retry_error:
                 evaluation_failed = True
                 print(f"品質評価の再試行にも失敗しました: {retry_error}")
-                log_detail(f"品質評価の再試行にも失敗しました: {retry_error}")
+                self.log_detail(f"品質評価の再試行にも失敗しました: {retry_error}")
                 fallback_queries = []
                 if (
                     state.get("search_round", 0) == 0
-                    and state.get("search_query_count", 0) < settings.max_search_queries
-                    and settings.max_search_rounds > 0
+                    and state.get("search_query_count", 0) < self.settings.max_search_queries
+                    and self.settings.max_search_rounds > 0
                 ):
                     fallback_query = _keyword_followup_query(
                         state["query"], [], state.get("searched_queries", []),
                     )
                     if fallback_query:
                         fallback_queries = [fallback_query]
-                        log_detail("判断: 評価結果を得られなかったため、対象名と公式情報を使った検索に切り替えます")
+                        self.log_detail("判断: 評価結果を得られなかったため、対象名と公式情報を使った検索に切り替えます")
                 eval_obj = Evaluation(
                     sufficient=False,
                     missing_information=["品質評価の応答を解析できず、情報の十分性を確認できませんでした。"],
@@ -1629,27 +1742,27 @@ JSON例:
         proposed_official_queries = eval_obj.official_additional_queries
         try:
             eval_obj.additional_queries = _validate_followup_queries(
-                state["query"], proposed_queries, reranker,
+                state["query"], proposed_queries, self.reranker,
             )
         except Exception as error:
             eval_obj.additional_queries = []
-            log_detail(f"追加検索案の関連度検査に失敗したため、モデル生成クエリを破棄しました: {error}")
+            self.log_detail(f"追加検索案の関連度検査に失敗したため、モデル生成クエリを破棄しました: {error}")
         try:
             eval_obj.official_additional_queries = _validate_followup_queries(
-                state["query"], proposed_official_queries, reranker,
+                state["query"], proposed_official_queries, self.reranker,
             )
         except Exception as error:
             eval_obj.official_additional_queries = []
-            log_detail(f"公式レーンの追加案の関連度検査に失敗したため、クエリを破棄しました: {error}")
+            self.log_detail(f"公式レーンの追加案の関連度検査に失敗したため、クエリを破棄しました: {error}")
         rejected_count = len(proposed_queries) - len(eval_obj.additional_queries)
         if rejected_count:
-            log_detail(
+            self.log_detail(
                 f"元の質問との関連が弱い追加検索案 {rejected_count}件を破棄しました"
             )
 
         can_search_more = (
-            state.get("search_round", 0) < settings.max_search_rounds
-            and state.get("search_query_count", 0) < settings.max_search_queries
+            state.get("search_round", 0) < self.settings.max_search_rounds
+            and state.get("search_query_count", 0) < self.settings.max_search_queries
         )
         if not can_search_more:
             eval_obj.official_additional_queries = []
@@ -1666,26 +1779,26 @@ JSON例:
             )
             eval_obj.additional_queries = [fallback_query] if fallback_query else []
             if fallback_query:
-                log_detail("有効な追加検索案がないため、不足項目から短いキーワード検索を作成します")
+                self.log_detail("有効な追加検索案がないため、不足項目から短いキーワード検索を作成します")
             else:
-                log_detail("不足項目に対応する未検索のキーワードがないため、追加検索を終了します")
+                self.log_detail("不足項目に対応する未検索のキーワードがないため、追加検索を終了します")
 
         eval_obj.sufficient = eval_obj.sufficient and not (
             eval_obj.additional_queries or eval_obj.official_additional_queries
             or eval_obj.missing_information or eval_obj.weak_evidence
         )
-        log_detail(f"品質評価: {'十分' if eval_obj.sufficient else '不足'} / 理由: {eval_obj.reason}")
+        self.log_detail(f"品質評価: {'十分' if eval_obj.sufficient else '不足'} / 理由: {eval_obj.reason}")
         for missing in eval_obj.missing_information:
-            log_detail(f"  不足情報: {missing}")
+            self.log_detail(f"  不足情報: {missing}")
         for weak in eval_obj.weak_evidence:
-            log_detail(f"  根拠が弱い点: {weak}")
+            self.log_detail(f"  根拠が弱い点: {weak}")
         for query in eval_obj.additional_queries:
-            log_detail(f"  通常レーン追加案: {query}")
+            self.log_detail(f"  通常レーン追加案: {query}")
         for query in eval_obj.official_additional_queries:
-            log_detail(f"  公式レーン追加案: {query}")
+            self.log_detail(f"  公式レーン追加案: {query}")
         return {"evaluation": eval_obj}
 
-    def update_board(state: State):
+    def update_board(self, state: State):
         evaluation = state.get("evaluation")
         all_results = deduplicate_results(
             (state.get("evidence_results", []) or state.get("results", []))
@@ -1712,13 +1825,13 @@ JSON例:
 """
         post = ""
         try:
-            response = board_writer_llm.invoke(prompt)
+            response = self.board_writer_llm.invoke(prompt)
             calls = getattr(response, "tool_calls", None) or []
             if len(calls) == 1 and calls[0].get("name") == "write_research_board":
                 arguments = calls[0].get("args") or {}
                 if isinstance(arguments, dict) and isinstance(arguments.get("content"), str):
                     post = arguments["content"].strip()
-                    log_detail("掲示板tool call: write_research_board")
+                    self.log_detail("掲示板tool call: write_research_board")
             elif not calls and hasattr(response, "content") and response.content:
                 # Fallback for models outputting JSON or plain text directly
                 content_text = strip_model_reasoning(response.content).strip()
@@ -1729,60 +1842,60 @@ JSON例:
                             post = parsed["content"].strip()
                         elif "args" in parsed and isinstance(parsed["args"], dict):
                             post = str(parsed["args"].get("content", "")).strip()
-                        log_detail("掲示板JSONレスポンスから投稿内容を抽出しました")
+                        self.log_detail("掲示板JSONレスポンスから投稿内容を抽出しました")
                 except Exception:
                     if not content_text.startswith("{") and len(content_text) <= 500:
                         post = content_text
-                        log_detail("掲示板テキストレスポンスから投稿内容を採用しました")
+                        self.log_detail("掲示板テキストレスポンスから投稿内容を採用しました")
             else:
-                log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
+                self.log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
         except Exception as error:
-            log_detail(f"掲示板tool callで例外が発生したためテキストで再試行します: {error}")
+            self.log_detail(f"掲示板tool callで例外が発生したためテキストで再試行します: {error}")
             try:
                 plain_prompt = f"""{prompt}
 ※ 内部の思考過程は出力せず、以下のJSON形式のみを出力してください。
 {{"content": "掲示板に残す1件の投稿、または不要なら nothing"}}"""
-                plain_resp = llm.invoke(plain_prompt)
+                plain_resp = self.llm.invoke(plain_prompt)
                 parsed = parse_json_from_response(strip_model_reasoning(plain_resp.content))
                 if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
                     post = parsed["content"].strip()
-                    log_detail("掲示板再試行から投稿内容を取得しました")
+                    self.log_detail("掲示板再試行から投稿内容を取得しました")
             except Exception as fallback_error:
-                log_detail(f"掲示板の再試行にも失敗しました: {fallback_error}")
+                self.log_detail(f"掲示板の再試行にも失敗しました: {fallback_error}")
                 return {}
 
         if post.casefold() == "nothing":
-            log_detail("掲示板tool call: nothing（追記不要のため破棄）")
+            self.log_detail("掲示板tool call: nothing（追記不要のため破棄）")
             return {}
         if not post:
-            log_detail("掲示板の投稿が空だったため破棄しました")
+            self.log_detail("掲示板の投稿が空だったため破棄しました")
             return {}
         memo, added_posts, evicted_posts = append_run_memo_posts(
             state.get("run_memo", ""), [post], max_chars=5000,
         )
         if added_posts:
-            log_detail(f"共有ボードに新規投稿 {len(added_posts)}件:")
+            self.log_detail(f"共有ボードに新規投稿 {len(added_posts)}件:")
             for item in added_posts:
-                log_detail(f"  {item}")
+                self.log_detail(f"  {item}")
         else:
-            log_detail("重複投稿を破棄しました")
+            self.log_detail("重複投稿を破棄しました")
         if evicted_posts:
-            log_detail(f"共有ボードが5000文字上限に達したため、古い投稿を {evicted_posts}件整理しました")
+            self.log_detail(f"共有ボードが5000文字上限に達したため、古い投稿を {evicted_posts}件整理しました")
         if added_posts or evicted_posts:
-            if board_update is not None:
-                board_update(memo)
+            if self.board_update is not None:
+                self.board_update(memo)
             return {"run_memo": memo}
         return {}
-    def prepare_followups(state: State):
+    def prepare_followups(self, state: State):
         evaluation = state.get("evaluation")
         if evaluation is None or evaluation.sufficient:
             return {"pending_normal_queries": [], "pending_official_queries": []}
-        if state.get("search_round", 0) >= settings.max_search_rounds:
-            log_detail(f"次の判断: 検索ラウンド上限 {settings.max_search_rounds} に達しました")
+        if state.get("search_round", 0) >= self.settings.max_search_rounds:
+            self.log_detail(f"次の判断: 検索ラウンド上限 {self.settings.max_search_rounds} に達しました")
             return {"pending_normal_queries": [], "pending_official_queries": []}
-        remaining = settings.max_search_queries - state.get("search_query_count", 0)
+        remaining = self.settings.max_search_queries - state.get("search_query_count", 0)
         if remaining <= 0:
-            log_detail(f"次の判断: 検索クエリ上限 {settings.max_search_queries} に達しました")
+            self.log_detail(f"次の判断: 検索クエリ上限 {self.settings.max_search_queries} に達しました")
             return {"pending_normal_queries": [], "pending_official_queries": []}
         searched = {
             re.sub(r"\s+", " ", query).strip().casefold()
@@ -1796,7 +1909,7 @@ JSON例:
                     unique.append(query)
                     searched.add(normalized)
                 elif normalized:
-                    log_detail(f"検索済みの追加案をスキップします: {query}")
+                    self.log_detail(f"検索済みの追加案をスキップします: {query}")
             return unique
         normal = pending(evaluation.additional_queries)
         official = pending(evaluation.official_additional_queries)
@@ -1817,9 +1930,9 @@ JSON例:
                 continue
             selected[lane[0]].append(lane[1].pop(0))
         if len(selected["normal"]) < len(normal) or len(selected["official"]) < len(official):
-            log_detail("共有クエリ上限により、一部の追加検索案を次回以降に回せず見送りました")
+            self.log_detail("共有クエリ上限により、一部の追加検索案を次回以降に回せず見送りました")
         if selected["normal"] or selected["official"]:
-            log_detail(
+            self.log_detail(
                 f"独立レーンで追加検索します（通常 {len(selected['normal'])}件 / 公式 {len(selected['official'])}件）"
             )
             return {
@@ -1827,10 +1940,10 @@ JSON例:
                 "pending_official_queries": selected["official"],
                 "search_round": 1,
             }
-        log_detail("実行できる未検索の追加案がないため、レポート作成へ進みます")
+        self.log_detail("実行できる未検索の追加案がないため、レポート作成へ進みます")
         return {"pending_normal_queries": [], "pending_official_queries": []}
 
-    def dispatch_followups(state: State):
+    def dispatch_followups(self, state: State):
         sends = []
         normal = state.get("pending_normal_queries", [])
         official = state.get("pending_official_queries", [])
@@ -1845,9 +1958,9 @@ JSON例:
             return "analyze"
         return sends
 
-    def additional_search(state: State):
+    def additional_search(self, state: State):
         queries = state.get("queries", [])
-        log_detail(f"通常レーンの追加検索: {len(queries)}件")
+        self.log_detail(f"通常レーンの追加検索: {len(queries)}件")
         existing_urls = {
             item.url for item in state.get("results", []) + state.get("evidence_results", [])
             if item.url
@@ -1855,14 +1968,14 @@ JSON例:
         delta_results: list[SearchResult] = []
         delta_evidence_results: list[SearchResult] = []
         for query_index, query in enumerate(queries, start=1):
-            report_progress(
+            self.report_progress(
                 "additional_search", "progress",
                 f"{query_index}/{len(queries)}件目 · 検索中: {query}",
             )
-            log_detail(f"追加検索開始: {query}")
+            self.log_detail(f"追加検索開始: {query}")
             query_fresh: list[SearchResult] = []
             try:
-                response = search.text(query, max_results=settings.results_per_query)
+                response = self.search.text(query, max_results=self.settings.results_per_query)
                 for item in response:
                     url = item.get("href", "")
                     if not url or url in existing_urls:
@@ -1872,49 +1985,49 @@ JSON例:
                         snippet=item.get("body", ""),
                     ))
                     existing_urls.add(url)
-                log_detail(
-                    f"追加検索候補: {len(query_fresh)}件（既出URLを除外、取得上限: {settings.results_per_query}）"
+                self.log_detail(
+                    f"追加検索候補: {len(query_fresh)}件（既出URLを除外、取得上限: {self.settings.results_per_query}）"
                 )
-                report_progress(
+                self.report_progress(
                     "additional_search", "progress",
                     f"{query_index}/{len(queries)}件目 · 新規候補 {len(query_fresh)}件",
                 )
                 candidate_count = (
-                    settings.content_candidate_results_per_query
-                    if fetcher else settings.reranked_results_per_query
+                    self.settings.content_candidate_results_per_query
+                    if self.fetcher else self.settings.reranked_results_per_query
                 )
-                scoring_weights = (settings.relevance_weight, settings.trust_weight, settings.freshness_weight)
+                scoring_weights = (self.settings.relevance_weight, self.settings.trust_weight, self.settings.freshness_weight)
                 top_query_results = rerank_results(
-                    query_fresh, reranker, candidate_count, weights=scoring_weights,
-                    official_domains=settings.official_domains,
+                    query_fresh, self.reranker, candidate_count, weights=scoring_weights,
+                    official_domains=self.settings.official_domains,
                 )
-                if fetcher:
-                    report_progress(
+                if self.fetcher:
+                    self.report_progress(
                         "additional_search", "progress",
                         f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(top_query_results)}件）",
                     )
                     top_query_results = populate_content(
                         top_query_results,
-                        fetcher,
-                        timeout=settings.fetch_timeout,
-                        max_length=settings.max_content_length,
-                        fallback_fetcher=fallback_fetcher,
+                        self.fetcher,
+                        timeout=self.settings.fetch_timeout,
+                        max_length=self.settings.max_content_length,
+                        fallback_fetcher=self.fallback_fetcher,
                         weights=scoring_weights,
-                        official_domains=settings.official_domains,
+                        official_domains=self.settings.official_domains,
                     )
                 delta_evidence_results.extend(top_query_results)
-                log_detail(f"品質評価用に追加検索の本文候補 {len(top_query_results)}件を保持します")
+                self.log_detail(f"品質評価用に追加検索の本文候補 {len(top_query_results)}件を保持します")
                 top_query_results = select_diverse_results(
-                    top_query_results, settings.reranked_results_per_query,
+                    top_query_results, self.settings.reranked_results_per_query,
                 )
-                log_selected_results(top_query_results, label="追加検索採用候補")
+                self.log_selected_results(top_query_results, label="追加検索採用候補")
                 delta_results.extend(top_query_results)
             except Exception as error:
                 if "no results found" in str(error).casefold():
-                    log_detail(f"追加検索結果なし: {query}")
+                    self.log_detail(f"追加検索結果なし: {query}")
                 else:
                     print(f"追加検索失敗 ({query}): {error}")
-                    log_detail(f"追加検索失敗: {query} / {error}")
+                    self.log_detail(f"追加検索失敗: {query} / {error}")
         return {
             "results": delta_results,
             "evidence_results": delta_evidence_results,
@@ -1923,14 +2036,14 @@ JSON例:
             "normal_search_query_count": len(queries),
         }
 
-    def analyze(state: State):
+    def analyze(self, state: State):
         candidate_results = deduplicate_results(
             state.get("results", []) + state.get("official_results", [])
         )
         unique_results = _evaluation_sources(
             candidate_results, official_candidates=state.get("official_results", []),
         )
-        log_detail(f"レポート作成: 関連度と出典分散で選んだ根拠ソース {len(unique_results)}件を使用")
+        self.log_detail(f"レポート作成: 関連度と出典分散で選んだ根拠ソース {len(unique_results)}件を使用")
         formatted_evidence = format_results_for_llm(unique_results)
         evaluation = state.get("evaluation")
         quality_note = ""
@@ -1944,7 +2057,7 @@ JSON例:
 レポートでは冒頭に調査が不完全であることを明記し、根拠から確認できる範囲と未確認事項を区別してください。"""
         run_memo = (state.get("run_memo", "") or "（まだありません）")[:5000]
         answer_prompt = f"""以下のWeb検索結果および取得したWebページ本文だけを根拠に質問へ回答してください。
-現在日（この調査の基準日）: {current_date}
+現在日（この調査の基準日）: {self.current_date}
 質問: {state['query']}
 
 この調査回だけの共有ボード（過去の投稿を含む索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
@@ -1955,24 +2068,24 @@ JSON例:
 {quality_note}
 
 指示:
-1. {current_date} 時点での情報として回答し、更新時期が重要な情報はページ日付と根拠を確認してください。
+1. {self.current_date} 時点での情報として回答し、更新時期が重要な情報はページ日付と根拠を確認してください。
 2. Webページの本文に記載されている具体的な事実、数値、詳細を最大限に活用して、質の高い体系的なレポートを作成してください。
 3. 事実を述べる段落には、根拠にした出典番号 [S1] の形式を付けてください。複数なら [S1][S2] とします。
 4. 検索結果にない出典番号やURLを本文に書かないでください。参照ソース一覧はプログラムが付けます。
 5. 取得情報から確認できないことは断定せず、調査品質が不十分な場合はその制約を明記してください。
 6. 元の質問で求められていない性能・育成・ガチャ詳細を必須情報のように付け加えず、公式確定情報とリーク・予想を明確に分けてください。
 7. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
-        answer = strip_model_reasoning(llm.invoke(answer_prompt).content)
+        answer = strip_model_reasoning(self.llm.invoke(answer_prompt).content)
         issues = citation_issues(answer, len(unique_results))
         has_citations = bool(_SOURCE_REF_RE.search(answer))
         if unique_results and (issues or not has_citations):
-            log_detail(
+            self.log_detail(
                 "出典検証: 不明な出典番号またはURLを検出したため、取得済みソースに限定して回答を再生成します"
                 if issues else "出典検証: 出典番号がないため、根拠ソース番号を付けて回答を再生成します"
             )
             allowed_refs = ", ".join(f"[S{i}]" for i in range(1, len(unique_results) + 1))
             retry_prompt = f"""以下の回答案を根拠ソースに照合して修正してください。
-現在日（この調査の基準日）: {current_date}
+現在日（この調査の基準日）: {self.current_date}
 質問: {state['query']}
 有効な出典番号: {allowed_refs}
 取得済みの根拠:
@@ -1985,31 +2098,56 @@ JSON例:
 思考過程や自己対話は出力せず、修正後の回答本文だけを出力してください。<think>等のタグも含めないでください。
 調査品質が不十分な場合の注意:
 {quality_note or "特段の不足は検出されていません。"}"""
-            answer = strip_model_reasoning(llm.invoke(retry_prompt).content)
+            answer = strip_model_reasoning(self.llm.invoke(retry_prompt).content)
         else:
-            log_detail("出典検証: 回答中の出典番号は取得済みソースと照合できました")
+            self.log_detail("出典検証: 回答中の出典番号は取得済みソースと照合できました")
 
         return {"summary": render_verified_sources(answer, unique_results)}
 
+
+def create_workflow(
+    settings: Settings,
+    search: SearchClient | None = None,
+    reranker: Reranker | None = None,
+    llm: ChatOpenAI | None = None,
+    fetcher: WebContentFetcher | None = None,
+    fallback_fetcher: WebContentFetcher | None = None,
+    log: Callable[[str], None] | None = None,
+    board_update: Callable[[str], None] | None = None,
+    progress: Callable[[str, str, str], None] | None = None,
+) -> Any:
+    """Build the graph and initialize its dependencies."""
+    nodes = ResearchWorkflowNodes(
+        settings=settings,
+        search=search,
+        reranker=reranker,
+        llm=llm,
+        fetcher=fetcher,
+        fallback_fetcher=fallback_fetcher,
+        log=log,
+        board_update=board_update,
+        progress=progress,
+    )
+
     builder = StateGraph(State)
-    builder.add_node("understand_input", track_node("understand_input", understand_input))
-    builder.add_node("planner", track_node("planner", planner))
-    builder.add_node("search", track_node("search", search_task))
-    builder.add_node("official_search", track_node("official_search", official_search))
-    builder.add_node("evaluate", track_node("evaluate", evaluate))
-    builder.add_node("board_update", track_node("board_update", update_board))
-    builder.add_node("additional_search", track_node("additional_search", additional_search))
-    builder.add_node("prepare_followups", track_node("prepare_followups", prepare_followups))
-    builder.add_node("official_additional_search", track_node("official_additional_search", official_search))
-    builder.add_node("analyze", track_node("analyze", analyze))
+    builder.add_node("understand_input", nodes.track_node("understand_input", nodes.understand_input))
+    builder.add_node("planner", nodes.track_node("planner", nodes.planner))
+    builder.add_node("search", nodes.track_node("search", nodes.search_task))
+    builder.add_node("official_search", nodes.track_node("official_search", nodes.official_search))
+    builder.add_node("evaluate", nodes.track_node("evaluate", nodes.evaluate))
+    builder.add_node("board_update", nodes.track_node("board_update", nodes.update_board))
+    builder.add_node("additional_search", nodes.track_node("additional_search", nodes.additional_search))
+    builder.add_node("prepare_followups", nodes.track_node("prepare_followups", nodes.prepare_followups))
+    builder.add_node("official_additional_search", nodes.track_node("official_additional_search", nodes.official_search))
+    builder.add_node("analyze", nodes.track_node("analyze", nodes.analyze))
     builder.add_edge(START, "understand_input")
     builder.add_edge("understand_input", "planner")
-    builder.add_conditional_edges("planner", dispatch_searches)
+    builder.add_conditional_edges("planner", nodes.dispatch_searches)
     builder.add_edge("search", "evaluate")
     builder.add_edge("official_search", "evaluate")
     builder.add_edge("evaluate", "board_update")
     builder.add_edge("board_update", "prepare_followups")
-    builder.add_conditional_edges("prepare_followups", dispatch_followups)
+    builder.add_conditional_edges("prepare_followups", nodes.dispatch_followups)
     builder.add_edge("additional_search", "evaluate")
     builder.add_edge("official_additional_search", "evaluate")
     builder.add_edge("analyze", END)

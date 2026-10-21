@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "search-orchestrator"
+version = "0.2.0"
+description = "AI-powered bounded web research orchestrator with reranking and evidence evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ddgs>=9.15.0",
+    "httpx>=0.27.0,<1.0.0",
+    "langchain>=0.2.0,<1.0.0",
+    "langchain-openai>=0.1.0,<1.0.0",
+    "langgraph>=0.2.0,<2.0.0",
+    "lxml>=5.0.0,<7.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "pyside6>=6.6.0,<7.0.0",
+    "sentence-transformers>=3.0.0,<6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+search-orchestrator = "main:main"
+search-orchestrator-gui = "gui.run:main"
+
+[tool.setuptools]
+py-modules = ["main", "search_orchestrator", "source_scoring", "fallback_fetcher"]
+packages = ["gui"]

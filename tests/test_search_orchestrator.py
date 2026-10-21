@@ -327,8 +327,18 @@ def test_workflow_end_to_end_with_mocks() -> None:
 
     result = workflow.invoke({
         "query": "Test Topic",
-        "plan": None, "task": None, "results": [], "evaluation": None,
-        "summary": "", "search_query_count": 0, "search_round": 0,
+        "understood_request": "",
+        "plan": None,
+        "task": None,
+        "results": [],
+        "evidence_results": [],
+        "official_results": [],
+        "evaluation": None,
+        "run_memo": "",
+        "summary": "",
+        "search_query_count": 0,
+        "search_round": 0,
+        "searched_queries": [],
     })
 
     assert result["summary"].startswith("Final summary report with detailed web evidence.")
@@ -392,8 +402,19 @@ def test_page_date_can_promote_a_candidate_before_final_selection() -> None:
         fetcher=MockFetcher(),
     )
     result = workflow.invoke({
-        "query": "Test", "plan": None, "task": None, "results": [],
-        "evaluation": None, "summary": "", "search_query_count": 0, "search_round": 0,
+        "query": "Test",
+        "understood_request": "",
+        "plan": None,
+        "task": None,
+        "results": [],
+        "evidence_results": [],
+        "official_results": [],
+        "evaluation": None,
+        "run_memo": "",
+        "summary": "",
+        "search_query_count": 0,
+        "search_round": 0,
+        "searched_queries": [],
     })
 
     assert [item.url for item in result["results"]] == [
@@ -436,8 +457,19 @@ def test_invalid_evaluation_response_is_not_treated_as_sufficient() -> None:
         llm=mock_llm,
     )
     result = workflow.invoke({
-        "query": "Test", "plan": None, "task": None, "results": [],
-        "evaluation": None, "summary": "", "search_query_count": 0, "search_round": 0,
+        "query": "Test",
+        "understood_request": "",
+        "plan": None,
+        "task": None,
+        "results": [],
+        "evidence_results": [],
+        "official_results": [],
+        "evaluation": None,
+        "run_memo": "",
+        "summary": "",
+        "search_query_count": 0,
+        "search_round": 0,
+        "searched_queries": [],
     })
 
     assert result["evaluation"].sufficient is False

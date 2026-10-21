@@ -60,6 +60,13 @@ class TestDefaultWebContentFetcher:
         fetcher = DefaultWebContentFetcher()
         assert fetcher.fetch("ftp://example.com") == ""
 
+    def test_fetch_rejects_ssrf_urls(self):
+        fetcher = DefaultWebContentFetcher()
+        assert fetcher.fetch("http://127.0.0.1/admin") == ""
+        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
+        assert fetcher.fetch("http://localhost:8080/") == ""
+        assert fetcher.fetch("http://10.0.0.1/internal") == ""
+
     def test_fetch_http_521_raises_fetch_error(self):
         fetcher = DefaultWebContentFetcher()
         http_response = MagicMock()
@@ -162,6 +169,12 @@ class TestFirecrawlFetcher:
         with pytest.raises(ValueError, match="absolute HTTP or HTTPS URL"):
             FirecrawlFetcher("localhost:3002")
 
+    def test_fetch_rejects_ssrf_urls(self):
+        fetcher = FirecrawlFetcher()
+        assert fetcher.fetch("http://127.0.0.1/admin") == ""
+        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
+        assert fetcher.fetch("http://localhost:8080/") == ""
+
 
 # ---------------------------------------------------------------------------
 # JinaReaderFetcher
@@ -197,6 +210,12 @@ class TestJinaReaderFetcher:
     def test_fetch_empty_url(self):
         fetcher = self._fetcher()
         assert fetcher.fetch("") == ""
+
+    def test_fetch_rejects_ssrf_urls(self):
+        fetcher = self._fetcher()
+        assert fetcher.fetch("http://127.0.0.1/admin") == ""
+        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
+        assert fetcher.fetch("http://localhost:8080/") == ""
 
     def test_fetch_http_403_raises_fetch_error(self):
         fetcher = self._fetcher()
