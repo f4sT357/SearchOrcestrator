@@ -9,7 +9,7 @@
   "reranked_results_per_query": 2,
   "fetch_web_content": true,
   "use_fallback_fetcher": false,
-  "content_fetcher": "firecrawl",
+  "content_fetcher": "builtin",
   "firecrawl_api_url": "http://localhost:3002",
   "max_content_length": 4000,
   "relevance_weight": 0.4,

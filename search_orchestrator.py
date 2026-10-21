@@ -196,6 +196,7 @@ class Evaluation(BaseModel):
     weak_evidence: list[str]
     reason: str
     additional_queries: list[str]
+    official_additional_queries: list[str] = Field(default_factory=list)
 
 
 
@@ -248,6 +249,10 @@ class State(TypedDict):
     search_query_count: Annotated[int, operator.add]
     search_round: Annotated[int, operator.add]
     searched_queries: Annotated[list[str], operator.add]
+    normal_search_query_count: Annotated[int, operator.add]
+    official_search_query_count: Annotated[int, operator.add]
+    pending_normal_queries: list[str]
+    pending_official_queries: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -971,22 +976,25 @@ def parse_json_from_response(text: str) -> dict:
 def normalize_evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
     """Normalize common local-LLM variants before validating the evaluation schema."""
     normalized = dict(data)
-    queries = normalized.get("additional_queries", [])
-    if isinstance(queries, list):
-        normalized_queries = []
-        for item in queries:
-            if isinstance(item, str):
-                normalized_queries.append(item)
-            elif isinstance(item, dict):
-                query = item.get("query") or item.get("search_query") or item.get("text")
+    def normalize_queries(key: str) -> None:
+        queries = normalized.get(key, [])
+        if isinstance(queries, list):
+            normalized_queries = []
+            for item in queries:
+                query = item if isinstance(item, str) else (
+                    item.get("query") or item.get("search_query") or item.get("text")
+                    if isinstance(item, dict) else None
+                )
                 if isinstance(query, str) and query.strip():
                     normalized_queries.append(query.strip())
-        normalized["additional_queries"] = normalized_queries
-    elif isinstance(queries, dict):
-        query = queries.get("query") or queries.get("search_query") or queries.get("text")
-        normalized["additional_queries"] = [query.strip()] if isinstance(query, str) and query.strip() else []
-    else:
-        normalized["additional_queries"] = []
+            normalized[key] = normalized_queries
+        elif isinstance(queries, dict):
+            query = queries.get("query") or queries.get("search_query") or queries.get("text")
+            normalized[key] = [query.strip()] if isinstance(query, str) and query.strip() else []
+        else:
+            normalized[key] = []
+    normalize_queries("additional_queries")
+    normalize_queries("official_additional_queries")
     return normalized
 
 
@@ -1134,7 +1142,7 @@ def create_workflow(
             if stage == "search":
                 task = state.get("task")
                 detail = task.query if task else "通常検索"
-            elif stage == "official_search":
+            elif stage in ("official_search", "official_additional_search"):
                 detail = f"{len(state.get('official_queries', []))}件の公式検索"
             elif stage == "additional_search":
                 evaluation = state.get("evaluation")
@@ -1351,11 +1359,13 @@ def create_workflow(
 
     def official_search(state: State):
         """Search independent queries dedicated to finding first-party sources."""
+        progress_stage = state.get("progress_stage", "official_search")
         queries = state.get("official_queries", [])[:5]
         if not queries:
             return {
                 "results": [], "evidence_results": [], "official_results": [],
                 "search_query_count": 0, "searched_queries": [],
+                "official_search_query_count": 0,
             }
         log_detail(f"公式ソース専用検索を開始します（最大 {len(queries)} クエリ）")
         evidence_results: list[SearchResult] = []
@@ -1366,13 +1376,21 @@ def create_workflow(
             settings.content_candidate_results_per_query
             if fetcher else settings.reranked_results_per_query
         )
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
+            report_progress(
+                progress_stage, "progress",
+                f"{query_index}/{len(queries)}件目 · 検索中: {query}",
+            )
             log_detail(f"公式ソース専用検索: {query}")
             searched_queries.append(query)
             candidates: list[SearchResult] = []
             try:
                 response = search.text(query, max_results=settings.results_per_query)
                 add_search_results(candidates, response, query)
+                report_progress(
+                    progress_stage, "progress",
+                    f"{query_index}/{len(queries)}件目 · 候補 {len(candidates)}件",
+                )
                 log_detail(f"公式ソース検索候補: {len(candidates)}件")
             except Exception as error:
                 if "no results found" in str(error).casefold():
@@ -1385,6 +1403,10 @@ def create_workflow(
                 official_domains=settings.official_domains,
             )
             if fetcher:
+                report_progress(
+                    progress_stage, "progress",
+                    f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(query_candidates)}件）",
+                )
                 query_candidates = populate_content(
                     query_candidates, fetcher, timeout=settings.fetch_timeout,
                     max_length=settings.max_content_length,
@@ -1410,12 +1432,13 @@ def create_workflow(
             "official_results": evidence_results,
             "search_query_count": len(searched_queries),
             "searched_queries": searched_queries,
+            "official_search_query_count": len(searched_queries),
         }
 
     def search_task(state: State):
         task = state.get("task")
         if task is None:
-            return {"results": [], "evidence_results": [], "search_query_count": 0, "searched_queries": []}
+            return {"results": [], "evidence_results": [], "search_query_count": 0, "searched_queries": [], "normal_search_query_count": 0}
         fresh_results: list[SearchResult] = []
         log_detail(f"検索開始: {task.query}（観点: {task.aspect}）")
         try:
@@ -1429,9 +1452,10 @@ def create_workflow(
                 log_detail(f"検索失敗: {task.query} / {error}")
             return {
                 "results": [], "evidence_results": [], "search_query_count": 1,
-                "searched_queries": [task.query],
+                "searched_queries": [task.query], "normal_search_query_count": 1,
             }
 
+        report_progress("search", "progress", f"候補 {len(fresh_results)}件 · {task.query}")
         log_detail(f"検索候補: {len(fresh_results)}件（取得上限: {settings.results_per_query}）")
 
         candidate_count = (
@@ -1445,6 +1469,7 @@ def create_workflow(
         )
         log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
         if fetcher:
+            report_progress("search", "progress", f"本文を取得中（候補 {len(top_results)}件） · {task.query}")
             top_results = populate_content(
                 top_results,
                 fetcher,
@@ -1465,6 +1490,7 @@ def create_workflow(
             "evidence_results": evidence_results,
             "search_query_count": 1,
             "searched_queries": [task.query],
+            "normal_search_query_count": 1,
         }
 
     def evaluate(state: State):
@@ -1513,7 +1539,7 @@ def create_workflow(
 
 追加検索案は質問・調査計画と上記の関連性が確認された情報源だけから作成してください。上記に含まれない情報源の内容や話題は推測・補完しないでください。関連度を満たす情報源がない場合は、質問と調査計画に直接沿った一般的な確認クエリだけを提案してください。
 
-additional_queries は検索エンジン向けの短いキーワード列にしてください。質問文や「〜について調査してください」のような依頼文は含めず、「対象名 + 不足している観点 + 必要なら公式/一次情報」の形にします。質問がすでにキーワード列なら、対象語をそのまま保持して不足項目だけを足してください。各クエリは1つの不足項目に絞り、3〜8語程度、説明文・理由・番号・検索演算子は付けません。既に検索済みの語句を繰り返さないでください。
+additional_queries は通常のWeb検索レーン向け、official_additional_queries は公式サイト・発表元・一次資料を探す公式レーン向けです。公式情報を探す案を通常レーンに混ぜず、二次情報や独立報道を探す案を公式レーンに混ぜないでください。どちらも検索エンジン向けの短いキーワード列とし、各クエリは1つの不足項目に絞り、説明文・理由・番号・検索演算子は付けません。既に検索済みの語句を繰り返さないでください。
 
 ## 評価指針
 各検索結果には「ソース区分」（primary / secondary / other）、「信頼度」（0-1）、「新鮮度」（0-1）が付与されています。
@@ -1527,7 +1553,7 @@ source区分が other、または信頼度が中立値であることだけで�
 5. **各主張についてソース間の一致・矛盾を確認する。重要な数値・仕様（性能、容量、価格など）は、可能な限り一次情報または複数の独立した根拠で照合する。**
 6. **「other」や信頼性を判断できないソース1件だけに依拠する主張は weak_evidence とする。高品質で独立した複数の二次情報が一致していれば、二次情報のみでも十分と判定してよい。**
 7. **新鮮度スコアが低い情報や、ページ間の矛盾・未確認事項を指摘する。**
-8. **追加検索が有効な不足だけ additional_queries に入れる。一次情報の所在を確かめる検索に加え、裏付けが不足する場合は独立した専門二次情報も探すクエリを提案する。**
+8. **追加検索が有効な不足だけをレーン別に提案する。公式の所在・発表・一次資料の確認は official_additional_queries、独立した専門二次情報の裏付けは additional_queries に入れる。両方が必要なら両方に提案する。**
 9. 共有ボードは既存投稿と根拠を確認する索引として参照してください。新規投稿の判断と書き込みは後続の専用ノードが行います。
 10. sufficiency は元の質問に対する回答可能性で判定する。質問されていない性能・育成・ガチャ詳細が未確認でも、それだけを理由に不足とはしない。
 
@@ -1541,11 +1567,12 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
   "missing_information": ["不足している情報1"],
   "weak_evidence": ["根拠が弱い点1（独立確認のない情報源、矛盾など）"],
   "reason": "評価理由",
-  "additional_queries": ["対象名 不足項目 公式", "対象名 別の不足項目"],
+  "additional_queries": ["対象名 不足項目 専門媒体"],
+  "official_additional_queries": ["対象名 不足項目 公式発表"],
 }}
 ```
 
-※ 十分な情報が揃っている場合は sufficient を true、missing_information / weak_evidence / additional_queries を空配列 [] にしてください。独立した高品質な二次情報で十分に裏付けられる場合も十分と判定できます。"""
+※ 十分な情報が揃っている場合は sufficient を true、missing_information / weak_evidence / additional_queries / official_additional_queries を空配列 [] にしてください。独立した高品質な二次情報で十分に裏付けられる場合も十分と判定できます。"""
         raw_evaluation = ""
         evaluation_failed = False
         try:
@@ -1561,14 +1588,14 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
                     raise RuntimeError("品質評価モデルから応答を取得できませんでした")
                 repair_prompt = f'''次の品質評価案を、指定形式の有効なJSONに修正してください。
 評価案の内容を保ち、値を推測で追加しないでください。JSON以外は出力しないでください。
-必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[])
-additional_queries の各要素は検索文そのものの文字列です。{{"query": "..."}} のようなオブジェクトを配列に入れないでください。
+必須キー: sufficient (boolean), missing_information (string[]), weak_evidence (string[]), reason (string), additional_queries (string[]), official_additional_queries (string[])
+両方のクエリ配列の各要素は検索文そのものの文字列です。{{"query": "..."}} のようなオブジェクトを配列に入れないでください。
 
 評価案:
 {raw_evaluation}
 
 JSON例:
-{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[]}}'''
+{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"official_additional_queries":[]}}'''
                 repaired = llm.invoke(repair_prompt)
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
@@ -1595,9 +1622,11 @@ JSON例:
                     weak_evidence=[],
                     reason=f"品質評価の応答を解析できませんでした: {retry_error}",
                     additional_queries=fallback_queries,
+                    official_additional_queries=[],
                 )
 
         proposed_queries = eval_obj.additional_queries
+        proposed_official_queries = eval_obj.official_additional_queries
         try:
             eval_obj.additional_queries = _validate_followup_queries(
                 state["query"], proposed_queries, reranker,
@@ -1605,6 +1634,13 @@ JSON例:
         except Exception as error:
             eval_obj.additional_queries = []
             log_detail(f"追加検索案の関連度検査に失敗したため、モデル生成クエリを破棄しました: {error}")
+        try:
+            eval_obj.official_additional_queries = _validate_followup_queries(
+                state["query"], proposed_official_queries, reranker,
+            )
+        except Exception as error:
+            eval_obj.official_additional_queries = []
+            log_detail(f"公式レーンの追加案の関連度検査に失敗したため、クエリを破棄しました: {error}")
         rejected_count = len(proposed_queries) - len(eval_obj.additional_queries)
         if rejected_count:
             log_detail(
@@ -1615,9 +1651,12 @@ JSON例:
             state.get("search_round", 0) < settings.max_search_rounds
             and state.get("search_query_count", 0) < settings.max_search_queries
         )
+        if not can_search_more:
+            eval_obj.official_additional_queries = []
         if (
             not eval_obj.sufficient
             and not eval_obj.additional_queries
+            and not eval_obj.official_additional_queries
             and can_search_more
             and (not evaluation_failed or state.get("search_round", 0) == 0)
         ):
@@ -1632,7 +1671,8 @@ JSON例:
                 log_detail("不足項目に対応する未検索のキーワードがないため、追加検索を終了します")
 
         eval_obj.sufficient = eval_obj.sufficient and not (
-            eval_obj.additional_queries or eval_obj.missing_information or eval_obj.weak_evidence
+            eval_obj.additional_queries or eval_obj.official_additional_queries
+            or eval_obj.missing_information or eval_obj.weak_evidence
         )
         log_detail(f"品質評価: {'十分' if eval_obj.sufficient else '不足'} / 理由: {eval_obj.reason}")
         for missing in eval_obj.missing_information:
@@ -1640,7 +1680,9 @@ JSON例:
         for weak in eval_obj.weak_evidence:
             log_detail(f"  根拠が弱い点: {weak}")
         for query in eval_obj.additional_queries:
-            log_detail(f"  追加検索案: {query}")
+            log_detail(f"  通常レーン追加案: {query}")
+        for query in eval_obj.official_additional_queries:
+            log_detail(f"  公式レーン追加案: {query}")
         return {"evaluation": eval_obj}
 
     def update_board(state: State):
@@ -1731,68 +1773,92 @@ JSON例:
                 board_update(memo)
             return {"run_memo": memo}
         return {}
-    def should_continue(state: State):
+    def prepare_followups(state: State):
         evaluation = state.get("evaluation")
         if evaluation is None or evaluation.sufficient:
-            log_detail("次の判断: 品質評価が十分（または未設定）のためレポート作成へ進みます")
-            return "analyze"
-        if state["search_round"] >= settings.max_search_rounds:
-            log_detail(f"次の判断: 検索ラウンド上限 {settings.max_search_rounds} に達したためレポート作成へ進みます")
-            return "analyze"
-        if state["search_query_count"] >= settings.max_search_queries:
-            log_detail(f"次の判断: 検索クエリ上限 {settings.max_search_queries} に達したためレポート作成へ進みます")
-            return "analyze"
-        if not evaluation.additional_queries:
-            log_detail("次の判断: 追加検索案がないためレポート作成へ進みます")
-            return "analyze"
+            return {"pending_normal_queries": [], "pending_official_queries": []}
+        if state.get("search_round", 0) >= settings.max_search_rounds:
+            log_detail(f"次の判断: 検索ラウンド上限 {settings.max_search_rounds} に達しました")
+            return {"pending_normal_queries": [], "pending_official_queries": []}
+        remaining = settings.max_search_queries - state.get("search_query_count", 0)
+        if remaining <= 0:
+            log_detail(f"次の判断: 検索クエリ上限 {settings.max_search_queries} に達しました")
+            return {"pending_normal_queries": [], "pending_official_queries": []}
         searched = {
             re.sub(r"\s+", " ", query).strip().casefold()
             for query in state.get("searched_queries", [])
         }
-        pending = [
-            query for query in evaluation.additional_queries
-            if re.sub(r"\s+", " ", query).strip().casefold() not in searched
+        def pending(queries):
+            unique = []
+            for query in queries:
+                normalized = re.sub(r"\s+", " ", query).strip().casefold()
+                if normalized and normalized not in searched:
+                    unique.append(query)
+                    searched.add(normalized)
+                elif normalized:
+                    log_detail(f"検索済みの追加案をスキップします: {query}")
+            return unique
+        normal = pending(evaluation.additional_queries)
+        official = pending(evaluation.official_additional_queries)
+        # Rotate a shared, finite budget toward the lane with fewer searches so far.
+        lanes = [
+            ["normal", normal, state.get("normal_search_query_count", 0)],
+            ["official", official, state.get("official_search_query_count", 0)],
         ]
-        if not pending:
-            log_detail("次の判断: 追加検索案がすべて検索済みのため、レポート作成へ進みます")
+        lanes.sort(key=lambda lane: (lane[2], 0 if lane[0] == "official" else 1))
+        selected = {"normal": [], "official": []}
+        for _ in range(remaining):
+            available = [lane for lane in lanes if lane[1]]
+            if not available:
+                break
+            lane = min(available, key=lambda item: (item[2] + len(selected[item[0]]), item[0] != "official"))
+            if lane[0] == "official" and len(selected["official"]) >= 5:
+                lane[1].clear()
+                continue
+            selected[lane[0]].append(lane[1].pop(0))
+        if len(selected["normal"]) < len(normal) or len(selected["official"]) < len(official):
+            log_detail("共有クエリ上限により、一部の追加検索案を次回以降に回せず見送りました")
+        if selected["normal"] or selected["official"]:
+            log_detail(
+                f"独立レーンで追加検索します（通常 {len(selected['normal'])}件 / 公式 {len(selected['official'])}件）"
+            )
+            return {
+                "pending_normal_queries": selected["normal"],
+                "pending_official_queries": selected["official"],
+                "search_round": 1,
+            }
+        log_detail("実行できる未検索の追加案がないため、レポート作成へ進みます")
+        return {"pending_normal_queries": [], "pending_official_queries": []}
+
+    def dispatch_followups(state: State):
+        sends = []
+        normal = state.get("pending_normal_queries", [])
+        official = state.get("pending_official_queries", [])
+        if normal:
+            sends.append(Send("additional_search", {"queries": normal}))
+        if official:
+            sends.append(Send("official_additional_search", {
+                "official_queries": official,
+                "progress_stage": "official_additional_search",
+            }))
+        if not sends:
             return "analyze"
-        log_detail("次の判断: 情報不足が残っているため、追加検索を実行します")
-        return "additional_search"
+        return sends
 
     def additional_search(state: State):
-        evaluation = state.get("evaluation")
-        if evaluation is None:
-            return {
-                "results": [], "evidence_results": [], "search_query_count": 0,
-                "search_round": 1, "searched_queries": [],
-            }
-        remaining = settings.max_search_queries - state["search_query_count"]
-        already_searched = {
-            re.sub(r"\s+", " ", query).strip().casefold()
-            for query in state.get("searched_queries", [])
-        }
-        queries = []
-        for query in evaluation.additional_queries:
-            normalized = re.sub(r"\s+", " ", query).strip().casefold()
-            if normalized in already_searched:
-                log_detail(f"検索済みの追加検索案をスキップします: {query}")
-                continue
-            already_searched.add(normalized)
-            queries.append(query)
-        queries = queries[:max(remaining, 0)]
-        log_detail(f"追加検索ラウンド: {len(queries)}件を実行（残りクエリ枠: {remaining}）")
-        if len(queries) < len(evaluation.additional_queries):
-            log_detail(
-                f"検索クエリ上限により追加検索案 {len(evaluation.additional_queries) - len(queries)}件を見送ります"
-            )
+        queries = state.get("queries", [])
+        log_detail(f"通常レーンの追加検索: {len(queries)}件")
         existing_urls = {
             item.url for item in state.get("results", []) + state.get("evidence_results", [])
             if item.url
         }
         delta_results: list[SearchResult] = []
         delta_evidence_results: list[SearchResult] = []
-        delta_official_results: list[SearchResult] = []
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
+            report_progress(
+                "additional_search", "progress",
+                f"{query_index}/{len(queries)}件目 · 検索中: {query}",
+            )
             log_detail(f"追加検索開始: {query}")
             query_fresh: list[SearchResult] = []
             try:
@@ -1809,6 +1875,10 @@ JSON例:
                 log_detail(
                     f"追加検索候補: {len(query_fresh)}件（既出URLを除外、取得上限: {settings.results_per_query}）"
                 )
+                report_progress(
+                    "additional_search", "progress",
+                    f"{query_index}/{len(queries)}件目 · 新規候補 {len(query_fresh)}件",
+                )
                 candidate_count = (
                     settings.content_candidate_results_per_query
                     if fetcher else settings.reranked_results_per_query
@@ -1819,6 +1889,10 @@ JSON例:
                     official_domains=settings.official_domains,
                 )
                 if fetcher:
+                    report_progress(
+                        "additional_search", "progress",
+                        f"{query_index}/{len(queries)}件目 · 本文を取得中（候補 {len(top_query_results)}件）",
+                    )
                     top_query_results = populate_content(
                         top_query_results,
                         fetcher,
@@ -1829,8 +1903,6 @@ JSON例:
                         official_domains=settings.official_domains,
                     )
                 delta_evidence_results.extend(top_query_results)
-                if re.search(r"(?:公式|お知らせ|告知|official|announcement|press release)", query, re.IGNORECASE):
-                    delta_official_results.extend(top_query_results)
                 log_detail(f"品質評価用に追加検索の本文候補 {len(top_query_results)}件を保持します")
                 top_query_results = select_diverse_results(
                     top_query_results, settings.reranked_results_per_query,
@@ -1846,10 +1918,9 @@ JSON例:
         return {
             "results": delta_results,
             "evidence_results": delta_evidence_results,
-            "official_results": delta_official_results,
             "search_query_count": len(queries),
-            "search_round": 1,
             "searched_queries": queries,
+            "normal_search_query_count": len(queries),
         }
 
     def analyze(state: State):
@@ -1928,6 +1999,8 @@ JSON例:
     builder.add_node("evaluate", track_node("evaluate", evaluate))
     builder.add_node("board_update", track_node("board_update", update_board))
     builder.add_node("additional_search", track_node("additional_search", additional_search))
+    builder.add_node("prepare_followups", track_node("prepare_followups", prepare_followups))
+    builder.add_node("official_additional_search", track_node("official_additional_search", official_search))
     builder.add_node("analyze", track_node("analyze", analyze))
     builder.add_edge(START, "understand_input")
     builder.add_edge("understand_input", "planner")
@@ -1935,9 +2008,9 @@ JSON例:
     builder.add_edge("search", "evaluate")
     builder.add_edge("official_search", "evaluate")
     builder.add_edge("evaluate", "board_update")
-    builder.add_conditional_edges("board_update", should_continue, {
-        "analyze": "analyze", "additional_search": "additional_search",
-    })
+    builder.add_edge("board_update", "prepare_followups")
+    builder.add_conditional_edges("prepare_followups", dispatch_followups)
     builder.add_edge("additional_search", "evaluate")
+    builder.add_edge("official_additional_search", "evaluate")
     builder.add_edge("analyze", END)
     return builder.compile()

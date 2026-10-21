@@ -66,8 +66,6 @@ SECONDARY_DOMAINS: frozenset[str] = frozenset({
     "bloomberg.com",
     "wsj.com",
     "ft.com",
-    "businesswire.com",
-    "prnewswire.com",
     "anandtech.com",
     "tomshardware.com",
     "servethehome.com",
