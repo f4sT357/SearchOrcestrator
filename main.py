@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--weight-relevance", type=float, help="順位スコアの関連度重み (0-1)")
     parser.add_argument("--weight-trust", type=float, help="順位スコアの信頼度重み (0-1)")
     parser.add_argument("--weight-freshness", type=float, help="順位スコアの新鮮度重み (0-1)")
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument("-v", "--verbose", action="store_true", help="詳細ログをリアルタイム表示")
+    verbosity_group.add_argument("-q", "--quiet", action="store_true", help="進捗表示を抑制し結果のみ出力")
     args = parser.parse_args(argv)
 
     if args.max_concurrency is not None and args.max_concurrency < 1:
@@ -113,7 +116,43 @@ def main(argv: list[str] | None = None) -> None:
         official_domains=settings.official_domains,
     )
 
-    workflow = create_workflow(settings)
+    def cli_log(message: str) -> None:
+        if args.verbose and not args.quiet:
+            print(f"[詳細] {message}")
+
+    def cli_progress(stage: str, status: str, detail: str = "") -> None:
+        if args.quiet:
+            return
+        stage_names = {
+            "understand_input": "依頼整理",
+            "planner": "計画立案",
+            "search": "通常検索",
+            "official_search": "公式検索",
+            "evaluate": "品質評価",
+            "board_update": "ボード記録",
+            "additional_search": "追加検索",
+            "analyze": "レポート作成",
+        }
+        name = stage_names.get(stage, stage)
+        detail_str = f" ({detail})" if detail else ""
+        if status == "started":
+            print(f"[{name}] 進行中{detail_str}")
+        elif status == "failed":
+            print(f"[{name}] 失敗{detail_str}")
+
+    def cli_board(memo: str) -> None:
+        if args.verbose and not args.quiet:
+            print(f"[調査ボード更新]\n{memo}\n")
+
+    if not args.quiet:
+        print(f"調査を開始します: 「{args.query}」")
+
+    workflow = create_workflow(
+        settings,
+        log=cli_log,
+        board_update=cli_board,
+        progress=cli_progress,
+    )
     result = workflow.invoke(
         {
             "query": args.query,

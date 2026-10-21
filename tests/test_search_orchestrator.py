@@ -309,6 +309,8 @@ def test_workflow_end_to_end_with_mocks() -> None:
   "additional_queries": []
 }
 ```''')
+        elif "調査依頼の受付担当" in prompt:
+            return MagicMock(content="対象: Test Topic\n目的: 調査\n観点: 概要\n条件: なし\n曖昧な点: なし")
         else:
             return MagicMock(content="Final summary report with detailed web evidence.")
 

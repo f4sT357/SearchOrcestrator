@@ -389,7 +389,14 @@ def _keyword_followup_query(
 
     facets = [_compact_query_terms(item) for item in missing_information]
     facets = [facet for facet in facets if facet]
-    facets.extend(("公式 キャラクター紹介", "公式 キャラクタープロフィール", "公式 告知"))
+    is_character_topic = any(
+        kw in original_query.casefold()
+        for kw in ("キャラ", "character", "登場人物", "主人公", "キャスト", "声優")
+    )
+    if is_character_topic:
+        facets.extend(("公式 キャラクター紹介", "公式 キャラクタープロフィール", "公式 告知"))
+    else:
+        facets.extend(("公式 発表", "公式 お知らせ", "公式サイト 最新情報", "公式 更新履歴", "公式 文書"))
     seen = {re.sub(r"\s+", " ", query).strip().casefold() for query in searched_queries}
     for facet in facets:
         query = re.sub(r"\s+", " ", f"{subject} {facet}").strip()
@@ -474,7 +481,9 @@ class DefaultWebContentFetcher:
 
     def extract_text_from_html(self, html_content: str, max_length: int = 3000) -> str:
         try:
-            tree = lxml.html.fromstring(html_content)
+            # Strip XML declaration if present to prevent lxml ValueError on Unicode strings
+            content_to_parse = re.sub(r"^\s*<\?xml[^>]*\?>", "", html_content, flags=re.IGNORECASE)
+            tree = lxml.html.fromstring(content_to_parse)
             date_metadata: list[str] = []
             for meta in tree.xpath("//meta[@content]"):
                 name = " ".join(filter(None, (
@@ -512,7 +521,14 @@ class DefaultWebContentFetcher:
                 cleaned = self._clean_text("\n".join(dict.fromkeys(date_metadata)) + "\n" + cleaned)
             return cleaned[:max_length]
         except Exception:
-            stripped = re.sub(r"<[^>]+>", " ", html_content)
+            # Strip script/style/nav/footer tags and their contents before generic tag stripping
+            stripped_blocks = re.sub(
+                r"<(script|style|nav|footer|header|noscript|svg|iframe|form)[^>]*>.*?</\1>",
+                " ",
+                html_content,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            stripped = re.sub(r"<[^>]+>", " ", stripped_blocks)
             return self._clean_text(stripped)[:max_length]
 
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
@@ -525,10 +541,25 @@ class DefaultWebContentFetcher:
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("content-type", "").lower()
+                text = resp.text
+                if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "latin-1", "ascii"}:
+                    meta_match = re.search(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)""", resp.content[:8192], flags=re.IGNORECASE)
+                    if meta_match:
+                        try:
+                            detected = meta_match.group(1).decode("ascii").lower()
+                            text = resp.content.decode(detected, errors="replace")
+                        except Exception:
+                            text = resp.content.decode("utf-8", errors="replace")
+                    else:
+                        try:
+                            text = resp.content.decode("utf-8")
+                        except UnicodeDecodeError:
+                            pass
+
                 if "text/html" in content_type or "application/xhtml+xml" in content_type or not content_type:
-                    return self.extract_text_from_html(resp.text, max_length=max_length)
+                    return self.extract_text_from_html(text, max_length=max_length)
                 elif "text/plain" in content_type:
-                    return self._clean_text(resp.text)[:max_length]
+                    return self._clean_text(text)[:max_length]
                 else:
                     return ""
         except httpx.HTTPStatusError as http_err:
@@ -552,7 +583,6 @@ class DefaultWebContentFetcher:
             raise FetchError(f"Network error fetching {url}", status=FetchStatus.CONNECTION_ERROR) from net_err
         except Exception as err:
             raise FetchError(f"Webページ取得失敗 ({url}): {err}", status=FetchStatus.FAILED) from err
-
 
 class FirecrawlFetcher:
     """Retrieve one page as Markdown from a self-hosted Firecrawl API."""
@@ -1147,7 +1177,8 @@ def create_workflow(
 
     def understand_input(state: State):
         query = state["query"].strip()
-        prompt = f"""あなたは調査依頼の受付担当です。ユーザーの入力だけを読み、後続の調査計画が誤解なく作れるよう依頼内容を短く整理してください。
+        prompt = f"""あなたは調査依頼の受付担当です。現在日: {current_date}
+ユーザーの入力だけを読み、後続の調査計画が誤解なく作れるよう依頼内容を短く整理してください。
 
 入力の意図を次の項目で日本語でまとめてください。
 - 調べたい対象と目的
@@ -1637,33 +1668,53 @@ JSON例:
 今回までの根拠ソース:
 {evidence}
 """
+        post = ""
         try:
             response = board_writer_llm.invoke(prompt)
+            calls = getattr(response, "tool_calls", None) or []
+            if len(calls) == 1 and calls[0].get("name") == "write_research_board":
+                arguments = calls[0].get("args") or {}
+                if isinstance(arguments, dict) and isinstance(arguments.get("content"), str):
+                    post = arguments["content"].strip()
+                    log_detail("掲示板tool call: write_research_board")
+            elif not calls and hasattr(response, "content") and response.content:
+                # Fallback for models outputting JSON or plain text directly
+                content_text = strip_model_reasoning(response.content).strip()
+                try:
+                    parsed = parse_json_from_response(content_text)
+                    if isinstance(parsed, dict):
+                        if "content" in parsed and isinstance(parsed["content"], str):
+                            post = parsed["content"].strip()
+                        elif "args" in parsed and isinstance(parsed["args"], dict):
+                            post = str(parsed["args"].get("content", "")).strip()
+                        log_detail("掲示板JSONレスポンスから投稿内容を抽出しました")
+                except Exception:
+                    if not content_text.startswith("{") and len(content_text) <= 500:
+                        post = content_text
+                        log_detail("掲示板テキストレスポンスから投稿内容を採用しました")
+            else:
+                log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
         except Exception as error:
-            log_detail(f"掲示板tool callに失敗しました: {error}")
-            return {}
+            log_detail(f"掲示板tool callで例外が発生したためテキストで再試行します: {error}")
+            try:
+                plain_prompt = f"""{prompt}
+※ 内部の思考過程は出力せず、以下のJSON形式のみを出力してください。
+{{"content": "掲示板に残す1件の投稿、または不要なら nothing"}}"""
+                plain_resp = llm.invoke(plain_prompt)
+                parsed = parse_json_from_response(strip_model_reasoning(plain_resp.content))
+                if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                    post = parsed["content"].strip()
+                    log_detail("掲示板再試行から投稿内容を取得しました")
+            except Exception as fallback_error:
+                log_detail(f"掲示板の再試行にも失敗しました: {fallback_error}")
+                return {}
 
-        calls = getattr(response, "tool_calls", None) or []
-        if len(calls) != 1:
-            log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
-            return {}
-        call = calls[0]
-        if call.get("name") != "write_research_board":
-            log_detail(f"想定外の掲示板tool callです: {call.get('name')}")
-            return {}
-        arguments = call.get("args") or {}
-        if not isinstance(arguments, dict) or not isinstance(arguments.get("content"), str):
-            log_detail("掲示板tool callのcontentが不正です。今回は書き込みません")
-            return {}
-        post = arguments["content"].strip()
-        log_detail("掲示板tool call: write_research_board")
         if post.casefold() == "nothing":
             log_detail("掲示板tool call: nothing（追記不要のため破棄）")
             return {}
         if not post:
-            log_detail("掲示板tool callが空投稿だったため破棄しました")
+            log_detail("掲示板の投稿が空だったため破棄しました")
             return {}
-
         memo, added_posts, evicted_posts = append_run_memo_posts(
             state.get("run_memo", ""), [post], max_chars=5000,
         )
@@ -1675,8 +1726,9 @@ JSON例:
             log_detail("重複投稿を破棄しました")
         if evicted_posts:
             log_detail(f"共有ボードが5000文字上限に達したため、古い投稿を {evicted_posts}件整理しました")
-        if board_update is not None and (added_posts or evicted_posts):
-            board_update(memo)
+        if added_posts or evicted_posts:
+            if board_update is not None:
+                board_update(memo)
             return {"run_memo": memo}
         return {}
     def should_continue(state: State):

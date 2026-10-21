@@ -27,7 +27,7 @@ def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     window.config_path = str(tmp_path / "config.json")
     assert window.windowTitle() == "Search Orchestrator - AI Web Research Assistant"
     assert window.query_edit.toPlainText() != ""
-    assert window.tabs.count() == 3
+    assert window.tabs.count() == 5
     assert window.start_btn.isEnabled()
     assert window.model_combo is not None
     assert window.model_combo.isEditable()
