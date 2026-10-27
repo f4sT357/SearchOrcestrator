@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from dataclasses import replace
 import os
 import sys
 from threading import Thread
@@ -559,6 +560,13 @@ class MainWindow(QMainWindow):
             "official_domains": list(normalize_official_domains(self.official_domains_edit.text())),
         }
         try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if not isinstance(existing, dict):
+                    raise ValueError("設定ファイルのトップレベルはJSONオブジェクトにしてください")
+                existing.update(data)
+                data = existing
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as exc:
@@ -595,7 +603,7 @@ class MainWindow(QMainWindow):
         self._save_config()
 
         max_concurrency = self.concurrency_spin.value()
-        settings = Settings(
+        settings = replace(self.default_settings,
             model=self.model_combo.currentText().strip() or self.default_settings.model,
             base_url=self.base_url_edit.text().strip() or self.default_settings.base_url,
             api_key=self.api_key_edit.text().strip() or self.default_settings.api_key,
@@ -846,3 +854,4 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
             }
         """)
+
