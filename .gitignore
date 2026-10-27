@@ -5,3 +5,4 @@ __pycache__/
 .env
 firecrawl-selfhost/
 *.lnk
+config.local.json

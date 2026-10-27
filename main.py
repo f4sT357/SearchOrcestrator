@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
         trust_weight=trust_weight,
         freshness_weight=freshness_weight,
         official_domains=settings.official_domains,
+        trusted_domains=settings.trusted_domains,
     )
 
     def cli_log(message: str) -> None:

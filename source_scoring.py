@@ -1,4 +1,4 @@
-﻿"""Source scoring utilities for SearchOrchestrator.
+"""Source scoring utilities for SearchOrchestrator.
 
 Three complementary dimensions are measured:
   1. Source type   – is this a primary (vendor/official) source?
@@ -21,67 +21,16 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 # Domain databases
 # ---------------------------------------------------------------------------
+# Source classification
+# ---------------------------------------------------------------------------
 
-# Primary sources – official organization, product, research, and standards domains
-PRIMARY_DOMAINS: frozenset[str] = frozenset({
-    # NVIDIA
-    "nvidia.com",
-    "developer.nvidia.com",
-    "docs.nvidia.com",
-    "investor.nvidia.com",
-    # AMD
-    "amd.com",
-    "developer.amd.com",
-    "rocm.docs.amd.com",
-    "investor.amd.com",
-    # Intel
-    "intel.com",
-    "ark.intel.com",
-    # Hyperscaler compute / AI
-    "cloud.google.com",
-    "ai.google.dev",
-    "aws.amazon.com",
-    "azure.microsoft.com",
-    "learn.microsoft.com",
-    # Academic
-    "arxiv.org",
-    "ieeexplore.ieee.org",
-    "dl.acm.org",
-    "nature.com",
-    "science.org",
-    # Standards bodies & consortia
-    "opencompute.org",
-    "isa-alliance.org",
-    # Patent databases
-    "patents.google.com",
-    "j-platpat.inpit.go.jp",
-})
-
-# Secondary sources – credible industry news / analyst firms
-SECONDARY_DOMAINS: frozenset[str] = frozenset({
-    "techcrunch.com",
-    "theverge.com",
-    "venturebeat.com",
-    "reuters.com",
-    "bloomberg.com",
-    "wsj.com",
-    "ft.com",
-    "anandtech.com",
-    "tomshardware.com",
-    "servethehome.com",
-    "semianalysis.com",
-    "nextplatform.com",
-    "hpcwire.com",
-    "globaldata.com",
-    "marketsandmarkets.com",
-    "idc.com",
-    "gartner.com",
-})
-
+# A domain is treated as primary only when the user has independently confirmed
+# that it is official for the current research context. The application keeps no
+# global publisher allowlist: ownership and relevance are question-dependent.
 # Trust score table (source_tier -> float 0-1)
 TRUST_SCORES: dict[str, float] = {
     "primary": 1.0,
-    "secondary": 0.65,
+    "secondary": 0.80,
     # Unclassified is unknown, not intrinsically low quality. Let relevance
     # and the evidence evaluator decide whether an unfamiliar publisher is useful.
     "other": 0.50,
@@ -128,7 +77,7 @@ def normalize_official_domains(domains: Iterable[str] | None) -> tuple[str, ...]
     """Normalize user-registered hosts, accepting either hostnames or URLs.
 
     Registered domains match themselves and their subdomains. Only register
-    domains independently confirmed by the user as official.
+    domains independently confirmed by the user for the requested tier.
     """
     normalized: list[str] = []
     seen: set[str] = set()
@@ -141,60 +90,46 @@ def normalize_official_domains(domains: Iterable[str] | None) -> tuple[str, ...]
         parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
         host = (parsed.hostname or "").rstrip(".").lower().removeprefix("www.")
         if not host:
-            raise ValueError(f"公式ドメインを解釈できません: {entry}")
+            raise ValueError(f"登録ドメインを解釈できません: {entry}")
         try:
             host = host.encode("idna").decode("ascii")
         except UnicodeError as exc:
-            raise ValueError(f"公式ドメインを解釈できません: {entry}") from exc
+            raise ValueError(f"登録ドメインを解釈できません: {entry}") from exc
         labels = host.split(".")
         if len(labels) < 2 or any(
             not label or len(label) > 63
             or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
             for label in labels
         ):
-            raise ValueError(f"公式ドメインの形式が正しくありません: {entry}")
+            raise ValueError(f"登録ドメインの形式が正しくありません: {entry}")
         if host not in seen:
             normalized.append(host)
             seen.add(host)
     return tuple(normalized)
 
 
-def source_tier(url: str, official_domains: Iterable[str] = ()) -> str:
-    """Return ``"primary"``, ``"secondary"``, or ``"other"`` for *url*."""
-    domain = _normalise_domain(url)
-    if not domain:
-        return "other"
-
-    # Check registered official domains
-    if official_domains:
-        if isinstance(official_domains, (set, frozenset)):
-            registered_set = official_domains
-        else:
-            registered_set = set(normalize_official_domains(official_domains))
-        if domain in registered_set:
-            return "primary"
-        parts = domain.split(".")
-        for i in range(1, len(parts) - 1):
-            if ".".join(parts[i:]) in registered_set:
-                return "primary"
-
-    # Exact match
-    if domain in PRIMARY_DOMAINS:
-        return "primary"
-    if domain in SECONDARY_DOMAINS:
-        return "secondary"
-
-    # Sub-domains lookup by parent hierarchy: O(depth) set lookup instead of O(N) iteration
+def _matches_registered_domain(domain: str, domains: Iterable[str]) -> bool:
+    if not domain or not domains:
+        return False
+    registered_set = domains if isinstance(domains, (set, frozenset)) else set(normalize_official_domains(domains))
+    if domain in registered_set:
+        return True
     parts = domain.split(".")
-    for i in range(1, len(parts) - 1):
-        parent = ".".join(parts[i:])
-        if parent in PRIMARY_DOMAINS:
-            return "primary"
-        if parent in SECONDARY_DOMAINS:
-            return "secondary"
+    return any(".".join(parts[index:]) in registered_set for index in range(1, len(parts) - 1))
 
+
+def source_tier(
+    url: str,
+    official_domains: Iterable[str] = (),
+    trusted_domains: Iterable[str] = (),
+) -> str:
+    """Classify user-registered official and trusted publisher domains."""
+    domain = _normalise_domain(url)
+    if _matches_registered_domain(domain, official_domains):
+        return "primary"
+    if _matches_registered_domain(domain, trusted_domains):
+        return "secondary"
     return "other"
-
 
 def extract_content_date(content: str | None) -> date | None:
     """Extract a likely publication/update date from labeled page text.
@@ -275,10 +210,13 @@ def freshness_score(
         return 0.5
 
 
-def domain_trust_score(url: str, official_domains: Iterable[str] = ()) -> float:
-    """Return a trust score (0-1) based on the domain tier of *url*."""
-    return TRUST_SCORES[source_tier(url, official_domains)]
-
+def domain_trust_score(
+    url: str,
+    official_domains: Iterable[str] = (),
+    trusted_domains: Iterable[str] = (),
+) -> float:
+    """Return a trust score (0-1) based on user-registered source tiers."""
+    return TRUST_SCORES[source_tier(url, official_domains, trusted_domains)]
 
 def composite_score(
     relevance: float | None,
@@ -289,6 +227,7 @@ def composite_score(
     w_trust: float = 0.30,
     w_freshness: float = 0.20,
     official_domains: Iterable[str] = (),
+    trusted_domains: Iterable[str] = (),
 ) -> float:
     """Combine relevance, trust, and freshness into a single ranking score.
 
@@ -302,7 +241,7 @@ def composite_score(
     if abs(sum(weights) - 1.0) > 1e-6:
         raise ValueError("Composite score weights must sum to 1")
 
-    trust = domain_trust_score(url, official_domains)
+    trust = domain_trust_score(url, official_domains, trusted_domains)
     fresh = freshness_score(url, content=content)
     if relevance is None:
         total_w = w_trust + w_freshness
@@ -311,8 +250,6 @@ def composite_score(
 
 
 __all__ = [
-    "PRIMARY_DOMAINS",
-    "SECONDARY_DOMAINS",
     "normalize_official_domains",
     "source_tier",
     "extract_content_date",

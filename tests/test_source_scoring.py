@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from source_scoring import composite_score, domain_trust_score, extract_content_date, freshness_score
+from source_scoring import composite_score, domain_trust_score, extract_content_date, freshness_score, source_tier
 
 
 def test_extract_content_date_supports_labeled_iso_and_japanese_dates() -> None:
@@ -53,3 +53,17 @@ def test_composite_score_accepts_configurable_weights_and_validates_them() -> No
 
 def test_unclassified_domain_is_neutral_for_ranking() -> None:
     assert domain_trust_score("https://unlisted-specialist.example/article") == 0.5
+
+
+def test_only_user_registered_domains_are_primary() -> None:
+    assert source_tier("https://nvidia.com/news") == "other"
+    assert domain_trust_score("https://nvidia.com/news") == 0.5
+    assert source_tier("https://news.publisher.example/item", ["publisher.example"]) == "primary"
+    assert domain_trust_score("https://news.publisher.example/item", ["publisher.example"]) == 1.0
+    assert source_tier("https://specialist.example/report", trusted_domains=["specialist.example"]) == "secondary"
+    assert domain_trust_score("https://specialist.example/report", trusted_domains=["specialist.example"]) == 0.80
+    assert source_tier(
+        "https://specialist.example/report",
+        official_domains=["specialist.example"],
+        trusted_domains=["specialist.example"],
+    ) == "primary"

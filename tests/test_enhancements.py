@@ -95,11 +95,11 @@ def test_update_board_fallback_when_tool_call_is_text_json() -> None:
     # Response without tool_calls attribute / empty tool_calls, but content contains JSON
     mock_resp = MagicMock()
     mock_resp.tool_calls = []
-    mock_resp.content = '{"content": "確認できた事実: A社の新製品発表"}'
-    mock_llm.bind_tools.return_value.invoke.return_value = mock_resp
+    mock_resp.content = '{"request":"A社 新製品","confirmed":[],"unresolved":[],"source_decisions":[],"next_action":"A社の新製品発表について回答作成"}'
+    mock_llm.bind.return_value.invoke.return_value = mock_resp
 
     board_updates = []
-    settings = Settings(max_search_rounds=1)
+    settings = Settings(max_search_rounds=1, memo_keeper_enabled=True)
     workflow = create_workflow(
         settings=settings,
         llm=mock_llm,

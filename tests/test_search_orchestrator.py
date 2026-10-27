@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock
 from datetime import date
 import json
+import pytest
+import httpx
+import search_orchestrator as orchestrator
 
 from search_orchestrator import (
     DefaultWebContentFetcher,
@@ -48,10 +51,94 @@ def test_final_answer_uses_evaluation_evidence_candidates() -> None:
     evidence = SearchResult(query="q", title="Evidence", url="https://example.com/evidence",
                             snippet="important evidence", relevance_score=0.8, combined_score=0.8)
     result = nodes.analyze({"query": "q", "results": [], "evidence_results": [evidence],
-                            "official_results": [], "evaluation": None})
+                            "official_results": [], "evaluation": None, "run_memo": "private memo"})
     assert "important evidence" in llm.invoke.call_args.args[0]
+    assert "private memo" not in llm.invoke.call_args.args[0]
     assert "https://example.com/evidence" in result["summary"]
 
+
+
+def test_final_answer_receives_only_source_linked_research_brief() -> None:
+    llm = MagicMock()
+    llm.invoke.return_value.content = "Supported statement [S1]"
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(), llm=llm,
+    )
+    evidence = SearchResult(
+        query="q", title="Evidence", url="https://example.com/evidence",
+        snippet="important evidence", relevance_score=0.8, combined_score=0.8,
+    )
+    memo = json.dumps({
+        "confirmed": [
+            {"source_url": evidence.url, "note": "Verified release detail"},
+            {"source_url": "https://untrusted.example/fake", "note": "Invented detail"},
+        ],
+        "unresolved": ["Confirm the release date"],
+        "source_decisions": [
+            {"url": evidence.url, "decision": "included", "reason": "Relevant"},
+            {"url": "https://untrusted.example/fake", "decision": "included", "reason": "Fake"},
+        ],
+    })
+
+    nodes.analyze({
+        "query": "q", "results": [], "evidence_results": [evidence],
+        "official_results": [], "evaluation": None, "run_memo": memo,
+    })
+
+    prompt = llm.invoke.call_args.args[0]
+    assert "Verified release detail" in prompt
+    assert "Confirm the release date" in prompt
+    assert "Invented detail" not in prompt
+    assert "untrusted.example" not in prompt
+
+def test_llm_metrics_report_usage_without_prompt_content() -> None:
+    response = MagicMock(content="safe response")
+    response.usage_metadata = {
+        "input_tokens": 12,
+        "output_tokens": 4,
+        "total_tokens": 16,
+    }
+    llm = MagicMock()
+    llm.invoke.return_value = response
+    logs: list[str] = []
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(),
+        llm=llm, log=logs.append,
+    )
+
+    result = nodes.invoke_llm("test_role", "private prompt text", source_count=3)
+
+    assert result is response
+    metric = json.loads(next(item.removeprefix("[LLM_METRIC] ") for item in logs))
+    assert metric["role"] == "test_role"
+    assert metric["input_chars"] == 19
+    assert metric["source_count"] == 3
+    assert metric["output_chars"] == 13
+    assert metric["input_tokens"] == 12
+    assert metric["output_tokens"] == 4
+    assert metric["total_tokens"] == 16
+    assert metric["status"] == "completed"
+    assert metric["duration_ms"] >= 0
+    assert all("private prompt text" not in item for item in logs)
+
+def test_llm_metrics_record_failures_without_prompt_content() -> None:
+    llm = MagicMock()
+    llm.invoke.side_effect = RuntimeError("provider failure")
+    logs: list[str] = []
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(),
+        llm=llm, log=logs.append,
+    )
+
+    with pytest.raises(RuntimeError, match="provider failure"):
+        nodes.invoke_llm("failure_role", "private prompt text")
+
+    metric = json.loads(next(item.removeprefix("[LLM_METRIC] ") for item in logs))
+    assert metric["role"] == "failure_role"
+    assert metric["status"] == "error"
+    assert metric["error_type"] == "RuntimeError"
+    assert metric["duration_ms"] >= 0
+    assert all("private prompt text" not in item for item in logs)
 
 def test_add_search_results_ignores_duplicate_urls() -> None:
     results = [SearchResult(query="old", title="Old", url="https://example.com", snippet="")]
@@ -84,6 +171,7 @@ def test_settings_load_config_then_environment_overrides(tmp_path, monkeypatch) 
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SEARCH_MODEL", "environment-model")
+    monkeypatch.setenv("SEARCH_TRUSTED_DOMAINS", "env-trusted.example")
     monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "environment-firecrawl-key")
 
@@ -100,6 +188,30 @@ def test_settings_load_config_then_environment_overrides(tmp_path, monkeypatch) 
     assert settings.firecrawl_api_url == "http://localhost:3002"
     assert settings.firecrawl_api_key == "environment-firecrawl-key"
 
+
+
+def test_settings_loads_local_config_after_shared_config_and_before_environment(tmp_path, monkeypatch) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model": "shared-model", "max_search_queries": 4,
+    }), encoding="utf-8")
+    (tmp_path / "config.local.json").write_text(json.dumps({
+        "model": "local-model", "max_search_queries": 6, "trusted_domains": ["specialist.example"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "__file__", str(tmp_path / "search_orchestrator.py"))
+    monkeypatch.delenv("SEARCH_MODEL", raising=False)
+
+    local_settings = Settings.from_environment()
+
+    assert local_settings.model == "local-model"
+    assert local_settings.max_search_queries == 6
+    assert local_settings.trusted_domains == ("specialist.example",)
+
+    monkeypatch.setenv("SEARCH_MODEL", "environment-model")
+    monkeypatch.setenv("SEARCH_TRUSTED_DOMAINS", "env-trusted.example")
+    environment_settings = Settings.from_environment()
+
+    assert environment_settings.model == "environment-model"
+    assert environment_settings.trusted_domains == ("env-trusted.example",)
 
 def test_settings_default_external_fallback_is_disabled(tmp_path, monkeypatch) -> None:
     for name in (
@@ -168,13 +280,13 @@ def test_rerank_results_uses_configurable_trust_weight() -> None:
 
     results = [
         SearchResult(query="q", title="High relevance", url="https://example.com/a", snippet="s"),
-        SearchResult(query="q", title="Primary", url="https://docs.nvidia.com/a", snippet="s"),
+        SearchResult(query="q", title="Registered official", url="https://news.official.example/a", snippet="s"),
     ]
     ranked = rerank_results(
         results, DummyReranker(), 2, weights=(0.0, 1.0, 0.0),
+        official_domains=("official.example",),
     )
-    assert ranked[0].title == "Primary"
-
+    assert ranked[0].title == "Registered official"
 
 def test_final_shortlist_prefers_distinct_publisher_hosts() -> None:
     sources = [
@@ -527,3 +639,197 @@ def test_fetch_available_models_with_mock() -> None:
         models_err = fetch_available_models("http://localhost:1234/v1")
         assert models_err == []
 
+
+
+def test_understand_input_uses_original_query_without_llm() -> None:
+    llm = MagicMock()
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(), llm=llm,
+    )
+
+    result = nodes.understand_input({"query": "Keep this request", "run_memo": ""})
+
+    assert result["understood_request"] == "Keep this request"
+    assert "Keep this request" in result["run_memo"]
+    llm.invoke.assert_not_called()
+
+
+def test_update_board_uses_deterministic_summary_when_memo_keeper_is_disabled() -> None:
+    llm = MagicMock()
+    updates: list[str] = []
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False, memo_keeper_enabled=False), search=MagicMock(), reranker=MagicMock(),
+        llm=llm, board_update=updates.append,
+    )
+    source = SearchResult(
+        query="q", title="Source", url="https://example.com/source", snippet="evidence",
+        relevance_score=0.9, combined_score=0.9,
+    )
+    evaluation = Evaluation(
+        sufficient=True, missing_information=[], weak_evidence=[], reason="Enough evidence",
+        additional_queries=[], official_additional_queries=[],
+    )
+
+    result = nodes.update_board({
+        "query": "question", "results": [source], "official_results": [],
+        "evaluation": evaluation, "run_memo": "",
+    })
+
+    assert "https://example.com/source" in result["run_memo"]
+    assert updates == [result["run_memo"]]
+    llm.invoke.assert_not_called()
+
+
+def test_content_fetcher_reuses_fresh_disk_cache(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "cache-control": "max-age=120", "etag": '"v1"'},
+            text="<html><body><main>cached body</main></body></html>",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = DefaultWebContentFetcher(
+        client=client, cache_dir=tmp_path, cache_ttl_seconds=60, min_host_interval_seconds=0,
+    )
+
+    assert fetcher.fetch("https://example.com/page") == "cached body"
+    assert fetcher.fetch("https://example.com/page") == "cached body"
+    assert len(requests) == 1
+    assert [path.name for path in tmp_path.iterdir()] != ["page.json"]
+
+
+def test_content_fetcher_revalidates_stale_cache_with_etag(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain", "cache-control": "max-age=0", "etag": '"v1"'},
+                text="cached body",
+            )
+        return httpx.Response(304, headers={"cache-control": "max-age=120", "etag": '"v1"'})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = DefaultWebContentFetcher(
+        client=client, cache_dir=tmp_path, cache_ttl_seconds=60, min_host_interval_seconds=0,
+    )
+
+    assert fetcher.fetch("https://example.com/page") == "cached body"
+    assert fetcher.fetch("https://example.com/page") == "cached body"
+    assert len(requests) == 2
+    assert requests[1].headers["if-none-match"] == '"v1"'
+
+
+def test_content_fetcher_does_not_store_no_store_responses(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "cache-control": "no-store"},
+            text=f"response {calls}",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = DefaultWebContentFetcher(
+        client=client, cache_dir=tmp_path, cache_ttl_seconds=60, min_host_interval_seconds=0,
+    )
+
+    assert fetcher.fetch("https://example.com/no-store") == "response 1"
+    assert fetcher.fetch("https://example.com/no-store") == "response 2"
+    assert calls == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_content_fetcher_retries_429_after_retry_after(tmp_path, monkeypatch) -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "2"})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "cache-control": "no-store"},
+            text="available",
+        )
+
+    monkeypatch.setattr("search_orchestrator.time.sleep", delays.append)
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = DefaultWebContentFetcher(
+        client=client, cache_dir=tmp_path, min_host_interval_seconds=0, max_retry_after_seconds=5,
+    )
+
+    assert fetcher.fetch("https://example.com/retry") == "available"
+    assert calls == 2
+    assert delays == [2.0]
+
+def test_source_trace_records_url_decision_and_official_status() -> None:
+    logs: list[str] = []
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False, official_domains=("python.org",)),
+        search=MagicMock(), reranker=MagicMock(), llm=MagicMock(), log=logs.append,
+    )
+    item = SearchResult(
+        query="q", title="Official", url="https://www.python.org/downloads/", snippet="",
+        relevance_score=0.8, fetch_status="success",
+    )
+
+    nodes.log_source_trace(
+        "quality_evaluation", item, "included", "Included in quality evaluation evidence.",
+        official_candidate=True,
+    )
+
+    trace = json.loads(next(line.removeprefix("[SOURCE_TRACE] ") for line in logs))
+    assert trace["url"] == item.url
+    assert trace["decision"] == "included"
+    assert trace["official_candidate"] is True
+    assert trace["registered_official"] is True
+    assert trace["fetch_status"] == "success"
+
+def test_memo_keeper_updates_bounded_json_without_main_prompt_leakage() -> None:
+    llm = MagicMock()
+    llm.bind.return_value.invoke.return_value.content = json.dumps({
+        "request": "question",
+        "confirmed": [{"source_url": "https://example.com/source", "note": "Confirmed fact"}],
+        "unresolved": ["Open point"],
+        "source_decisions": [{
+            "url": "https://example.com/source", "decision": "included", "reason": "Relevant",
+        }],
+        "next_action": "Answer from the selected evidence.",
+    })
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False, memo_keeper_max_chars=600),
+        search=MagicMock(), reranker=MagicMock(), llm=llm,
+    )
+    source = SearchResult(
+        query="q", title="Source", url="https://example.com/source", snippet="evidence",
+        relevance_score=0.9, combined_score=0.9,
+    )
+    evaluation = Evaluation(
+        sufficient=True, missing_information=[], weak_evidence=[], reason="Enough evidence",
+        additional_queries=[], official_additional_queries=[],
+    )
+
+    result = nodes.update_board({
+        "query": "question", "results": [source], "official_results": [],
+        "evaluation": evaluation, "run_memo": "private old memo",
+    })
+
+    memo = json.loads(result["run_memo"])
+    assert memo["confirmed"] == [{"source_url": source.url, "note": "Confirmed fact"}]
+    assert memo["source_decisions"][0]["url"] == source.url
+    assert len(result["run_memo"]) <= 600
+    memo_prompt = llm.bind.return_value.invoke.call_args.args[0]
+    assert "private old memo" in memo_prompt
+    assert nodes.llm.invoke.call_count == 0

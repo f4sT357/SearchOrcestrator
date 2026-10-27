@@ -1,5 +1,4 @@
 {
-  "model": "qwen3.5-9b-ultra-uncensored-heretic-v2-i1",
   "base_url": "http://localhost:1234/v1",
   "max_concurrency": 5,
   "max_search_queries": 8,
@@ -12,8 +11,17 @@
   "content_fetcher": "builtin",
   "firecrawl_api_url": "http://localhost:3002",
   "max_content_length": 4000,
+  "memo_keeper_enabled": true,
+  "memo_keeper_max_chars": 1200,
+  "memo_keeper_max_output_tokens": 300,
+  "web_cache_enabled": true,
+  "web_cache_ttl_seconds": 21600,
+  "web_cache_dir": ".cache/web-content",
+  "web_host_min_interval_seconds": 0.5,
+  "web_max_retry_after_seconds": 30.0,
   "relevance_weight": 0.4,
   "trust_weight": 0.3,
   "freshness_weight": 0.3,
-  "official_domains": []
+  "official_domains": [],
+  "trusted_domains": []
 }

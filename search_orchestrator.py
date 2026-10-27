@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import operator
 import os
 import re
+import time
 from functools import lru_cache
 from threading import Lock
 from dataclasses import dataclass
@@ -70,7 +72,7 @@ class FetchError(Exception):
 
 @dataclass(frozen=True)
 class Settings:
-    model: str = "lfm2.5-8b-a1b-heretic-imatrix"
+    model: str = ""
     base_url: str = "http://localhost:1234/v1"
     api_key: str = "lm-studio"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
@@ -95,15 +97,34 @@ class Settings:
     use_fallback_fetcher: bool = False
     jina_api_url: str = "https://r.jina.ai/"
     official_domains: tuple[str, ...] = ()
+    trusted_domains: tuple[str, ...] = ()
+    use_llm_board_summary: bool = False
+    memo_keeper_enabled: bool = True
+    memo_keeper_max_chars: int = 1200
+    memo_keeper_max_output_tokens: int = 300
+    web_cache_enabled: bool = True
+    web_cache_ttl_seconds: int = 21600
+    web_cache_dir: str = ".cache/web-content"
+    web_host_min_interval_seconds: float = 0.5
+    web_max_retry_after_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "official_domains", normalize_official_domains(self.official_domains))
+        object.__setattr__(self, "trusted_domains", normalize_official_domains(self.trusted_domains))
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         if self.max_search_queries < 1 or self.max_search_rounds < 0:
             raise ValueError("max_search_queries must be at least 1 and max_search_rounds cannot be negative")
         if self.max_content_length < 1:
             raise ValueError("max_content_length must be at least 1")
+        if self.memo_keeper_max_chars < 400:
+            raise ValueError("memo_keeper_max_chars must be at least 400")
+        if self.memo_keeper_max_output_tokens < 32:
+            raise ValueError("memo_keeper_max_output_tokens must be at least 32")
+        if self.web_cache_ttl_seconds < 0:
+            raise ValueError("web_cache_ttl_seconds cannot be negative")
+        if self.web_host_min_interval_seconds < 0 or self.web_max_retry_after_seconds < 0:
+            raise ValueError("web fetch timing settings cannot be negative")
         if self.content_fetcher not in {"builtin", "firecrawl"}:
             raise ValueError("content_fetcher must be 'builtin' or 'firecrawl'")
         weights = (self.relevance_weight, self.trust_weight, self.freshness_weight)
@@ -114,20 +135,25 @@ class Settings:
 
     @classmethod
     def from_environment(cls, config_path: str | Path | None = None) -> "Settings":
-        """Load defaults, then config.json, then supported environment overrides."""
-        path = Path(config_path) if config_path else Path(__file__).with_name("config.json")
+        """Load shared defaults, local overrides, then supported environment overrides."""
+        shared_path = Path(config_path) if config_path else Path(__file__).with_name("config.json")
+        config_paths = [shared_path]
+        if config_path is None:
+            config_paths.append(shared_path.with_name("config.local.json"))
+
         values: dict[str, Any] = {}
-        if path.exists():
+        allowed = set(cls.__dataclass_fields__) - {"firecrawl_api_key"}
+        for path in config_paths:
+            if not path.exists():
+                continue
             try:
                 with path.open("r", encoding="utf-8") as config_file:
                     loaded = json.load(config_file)
                 if not isinstance(loaded, dict):
                     raise ValueError("設定ファイルのトップレベルはJSONオブジェクトにしてください")
-                allowed = set(cls.__dataclass_fields__) - {"firecrawl_api_key"}
                 values.update({key: value for key, value in loaded.items() if key in allowed})
             except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError(f"設定ファイルを読み込めません: {path}: {exc}") from exc
-
         for key, env_name in (
             ("model", "SEARCH_MODEL"),
             ("base_url", "SEARCH_BASE_URL"),
@@ -147,6 +173,10 @@ class Settings:
         if "SEARCH_OFFICIAL_DOMAINS" in os.environ:
             values["official_domains"] = tuple(
                 d.strip() for d in os.environ["SEARCH_OFFICIAL_DOMAINS"].split(",") if d.strip()
+            )
+        if "SEARCH_TRUSTED_DOMAINS" in os.environ:
+            values["trusted_domains"] = tuple(
+                d.strip() for d in os.environ["SEARCH_TRUSTED_DOMAINS"].split(",") if d.strip()
             )
         return cls(**values)
 
@@ -317,6 +347,8 @@ MIN_RELEVANCE_FOR_EVALUATION = 0.20
 MIN_RELEVANCE_FOR_FOLLOWUP_QUERY = 0.60
 MAX_EVIDENCE_SOURCES = 6
 MAX_EVIDENCE_CHARS = 9000
+MAX_EVALUATION_EVIDENCE_CHARS = 6000
+MAX_OFFICIAL_EVALUATION_EVIDENCE_CHARS = 2000
 _PLACEHOLDER_QUERY_RE = re.compile(
     r"(?:リサーチプランナー|詳細調査クエリ\s*\d+|検索クエリ\s*\d+|search query\s*#?\d+)",
     re.IGNORECASE,
@@ -499,7 +531,16 @@ def is_safe_url(url: str) -> bool:
 class DefaultWebContentFetcher:
     """Fetch and extract clean, readable text from a URL using httpx and lxml."""
 
-    def __init__(self, headers: dict[str, str] | None = None, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        headers: dict[str, str] | None = None,
+        client: httpx.Client | None = None,
+        *,
+        cache_dir: str | Path | None = None,
+        cache_ttl_seconds: int = 21600,
+        min_host_interval_seconds: float = 0.5,
+        max_retry_after_seconds: float = 30.0,
+    ) -> None:
         self.headers = headers or {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -511,6 +552,14 @@ class DefaultWebContentFetcher:
         }
         self._client = client
         self._owns_client = client is None
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.cache_ttl_seconds = max(0, cache_ttl_seconds)
+        self.min_host_interval_seconds = max(0.0, min_host_interval_seconds)
+        self.max_retry_after_seconds = max(0.0, max_retry_after_seconds)
+        self._cache_lock = Lock()
+        self._host_locks: dict[str, Lock] = {}
+        self._host_locks_lock = Lock()
+        self._host_last_request: dict[str, float] = {}
 
     def _get_client(self, timeout: float = 8.0) -> Any:
         if self._client is None or getattr(self._client, "is_closed", False):
@@ -592,39 +641,155 @@ class DefaultWebContentFetcher:
             stripped = re.sub(r"<[^>]+>", " ", stripped_blocks)
             return self._clean_text(stripped)[:max_length]
 
+    def _cache_path(self, url: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{digest}.json"
+
+    def _load_cached_page(self, url: str) -> dict[str, Any] | None:
+        path = self._cache_path(url)
+        if path is None:
+            return None
+        with self._cache_lock:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
+            return None
+        return payload
+
+    def _store_cached_page(self, url: str, entry: dict[str, Any]) -> None:
+        path = self._cache_path(url)
+        if path is None:
+            return
+        with self._cache_lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path = path.with_suffix(".tmp")
+                temporary_path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+                temporary_path.replace(path)
+            except OSError:
+                return
+
+    def _delete_cached_page(self, url: str) -> None:
+        path = self._cache_path(url)
+        if path is None:
+            return
+        with self._cache_lock:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return
+
+    def _cache_lifetime(self, headers: Any) -> float | None:
+        cache_control = str(headers.get("cache-control", "")).lower()
+        directives = [item.strip() for item in cache_control.split(",")]
+        if "no-store" in directives:
+            return None
+        max_age = next((item.split("=", 1)[1] for item in directives if item.startswith("max-age=")), None)
+        try:
+            server_ttl = max(0.0, float(max_age)) if max_age is not None else self.cache_ttl_seconds
+        except ValueError:
+            server_ttl = self.cache_ttl_seconds
+        return min(float(self.cache_ttl_seconds), server_ttl)
+
+    @staticmethod
+    def _cache_headers(entry: dict[str, Any] | None) -> dict[str, str]:
+        if not entry:
+            return {}
+        headers: dict[str, str] = {}
+        if isinstance(entry.get("etag"), str) and entry["etag"]:
+            headers["If-None-Match"] = entry["etag"]
+        if isinstance(entry.get("last_modified"), str) and entry["last_modified"]:
+            headers["If-Modified-Since"] = entry["last_modified"]
+        return headers
+
+    def _host_lock(self, url: str) -> tuple[str, Lock]:
+        host = (urlparse(url).netloc or "").casefold()
+        with self._host_locks_lock:
+            return host, self._host_locks.setdefault(host, Lock())
+
+    def _get(self, client: Any, url: str, headers: dict[str, str]) -> Any:
+        host, host_lock = self._host_lock(url)
+        with host_lock:
+            elapsed = time.monotonic() - self._host_last_request.get(host, 0.0)
+            if elapsed < self.min_host_interval_seconds:
+                time.sleep(self.min_host_interval_seconds - elapsed)
+            self._host_last_request[host] = time.monotonic()
+            return client.get(url, headers=headers) if headers else client.get(url)
+
+    def _retry_after_seconds(self, headers: Any) -> float:
+        try:
+            seconds = float(headers.get("retry-after", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        return min(max(0.0, seconds), self.max_retry_after_seconds)
+
+    def _extract_response_text(self, resp: Any, max_length: int) -> str:
+        content_type = resp.headers.get("content-type", "").lower()
+        text = resp.text
+        if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "latin-1", "ascii"}:
+            meta_match = re.search(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)""", resp.content[:8192], flags=re.IGNORECASE)
+            if meta_match:
+                try:
+                    detected = meta_match.group(1).decode("ascii").lower()
+                    text = resp.content.decode(detected, errors="replace")
+                except Exception:
+                    text = resp.content.decode("utf-8", errors="replace")
+            else:
+                try:
+                    text = resp.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+        if "text/html" in content_type or "application/xhtml+xml" in content_type or not content_type:
+            return self.extract_text_from_html(text, max_length=max_length)
+        if "text/plain" in content_type:
+            return self._clean_text(text)[:max_length]
+        return ""
+
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
         if not is_safe_url(url):
             return ""
+        cached = self._load_cached_page(url)
+        if cached and float(cached.get("fresh_until", 0)) > time.time():
+            return cached["content"][:max_length]
         try:
             client = self._get_client(timeout=timeout)
-            resp = client.get(url)
+            headers = self._cache_headers(cached)
+            resp = self._get(client, url, headers)
+            if resp.status_code == 429:
+                delay = self._retry_after_seconds(resp.headers)
+                if delay:
+                    time.sleep(delay)
+                    resp = self._get(client, url, headers)
+            if resp.status_code == 304 and cached:
+                lifetime = self._cache_lifetime(resp.headers)
+                if lifetime is not None:
+                    cached["fresh_until"] = time.time() + lifetime
+                    if resp.headers.get("etag"):
+                        cached["etag"] = resp.headers["etag"]
+                    if resp.headers.get("last-modified"):
+                        cached["last_modified"] = resp.headers["last-modified"]
+                    self._store_cached_page(url, cached)
+                return cached["content"][:max_length]
             resp.raise_for_status()
-
-            content_type = resp.headers.get("content-type", "").lower()
-            text = resp.text
-            if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "latin-1", "ascii"}:
-                meta_match = re.search(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_-]+)""", resp.content[:8192], flags=re.IGNORECASE)
-                if meta_match:
-                    try:
-                        detected = meta_match.group(1).decode("ascii").lower()
-                        text = resp.content.decode(detected, errors="replace")
-                    except Exception:
-                        text = resp.content.decode("utf-8", errors="replace")
-                else:
-                    try:
-                        text = resp.content.decode("utf-8")
-                    except UnicodeDecodeError:
-                        pass
-
-            if "text/html" in content_type or "application/xhtml+xml" in content_type or not content_type:
-                return self.extract_text_from_html(text, max_length=max_length)
-            elif "text/plain" in content_type:
-                return self._clean_text(text)[:max_length]
-            else:
-                return ""
+            content = self._extract_response_text(resp, max_length)
+            lifetime = self._cache_lifetime(resp.headers)
+            if content and lifetime is not None:
+                self._store_cached_page(url, {
+                    "content": content,
+                    "stored_at": time.time(),
+                    "fresh_until": time.time() + lifetime,
+                    "etag": resp.headers.get("etag", ""),
+                    "last_modified": resp.headers.get("last-modified", ""),
+                })
+            elif lifetime is None:
+                self._delete_cached_page(url)
+            return content
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
-            # Map known status codes to FetchStatus enum
             mapping = {
                 521: FetchStatus.HTTP_521,
                 403: FetchStatus.HTTP_403,
@@ -635,14 +800,13 @@ class DefaultWebContentFetcher:
                 503: FetchStatus.HTTP_503,
                 504: FetchStatus.HTTP_504,
             }
-            fetch_status = mapping.get(status_code, FetchStatus.FAILED)
-            raise FetchError(f"HTTP error {status_code} for {url}", status=fetch_status) from http_err
+            raise FetchError(f"HTTP error {status_code} for {url}", status=mapping.get(status_code, FetchStatus.FAILED)) from http_err
         except httpx.TimeoutException as timeout_err:
             raise FetchError(f"Timeout fetching {url}", status=FetchStatus.TIMEOUT) from timeout_err
         except httpx.NetworkError as net_err:
             raise FetchError(f"Network error fetching {url}", status=FetchStatus.CONNECTION_ERROR) from net_err
         except Exception as err:
-            raise FetchError(f"Webページ取得失敗 ({url}): {err}", status=FetchStatus.FAILED) from err
+            raise FetchError(f"Web page fetch failed ({url}): {err}", status=FetchStatus.FAILED) from err
 
 class FirecrawlFetcher:
     """Retrieve one page as Markdown from a self-hosted Firecrawl API."""
@@ -853,6 +1017,7 @@ def rerank_results(
     *,
     weights: tuple[float, float, float] = (0.50, 0.30, 0.20),
     official_domains: tuple[str, ...] = (),
+    trusted_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
     valid_results = [item for item in results if item.url]
     if not valid_results:
@@ -863,13 +1028,14 @@ def rerank_results(
     enriched: list[SearchResult] = []
     for item, rel_score in zip(valid_results, raw_scores, strict=True):
         rel = float(rel_score)
-        tier = source_tier(item.url, official_domains)
-        trust = domain_trust_score(item.url, official_domains)
+        tier = source_tier(item.url, official_domains, trusted_domains)
+        trust = domain_trust_score(item.url, official_domains, trusted_domains)
         fresh = freshness_score(item.url)
         comb = composite_score(
             rel, item.url,
             w_relevance=weights[0], w_trust=weights[1], w_freshness=weights[2],
             official_domains=official_domains,
+            trusted_domains=trusted_domains,
         )
         enriched.append(item.model_copy(update={
             "relevance_score": rel,
@@ -908,6 +1074,7 @@ def populate_content(
     fallback_fetcher: WebContentFetcher | None = None,
     weights: tuple[float, float, float] = (0.50, 0.30, 0.20),
     official_domains: tuple[str, ...] = (),
+    trusted_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
     """Fetch web content for each result, falling back to Jina Reader on failure."""
     if not fetcher:
@@ -956,6 +1123,7 @@ def populate_content(
             relevance, item.url, content=item.content,
             w_relevance=weights[0], w_trust=weights[1], w_freshness=weights[2],
             official_domains=official_domains,
+            trusted_domains=trusted_domains,
         )
         rescored.append(item.model_copy(update={
             "page_date": page_date.isoformat() if page_date else None,
@@ -1132,6 +1300,50 @@ def append_run_memo_posts(
     return "\n".join(entries), added, evicted
 
 
+
+def research_brief_context(raw_memo: str, known_urls: set[str], *, max_chars: int = 600) -> str:
+    """Return only source-linked facts and open questions from a compact research brief."""
+    try:
+        memo = json.loads(raw_memo)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(memo, dict):
+        return ""
+
+    lines: list[str] = []
+    unresolved = memo.get("unresolved", [])
+    if isinstance(unresolved, list):
+        questions = [str(item).strip()[:140] for item in unresolved if str(item).strip()][:3]
+        if questions:
+            lines.append("Open questions: " + " | ".join(questions))
+
+    confirmed = memo.get("confirmed", [])
+    if isinstance(confirmed, list):
+        facts: list[str] = []
+        for item in confirmed:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("source_url", "")).strip()
+            note = str(item.get("note", "")).strip()[:140]
+            if url in known_urls and note:
+                facts.append(f"{note} ({url})")
+        if facts:
+            lines.append("Source-linked facts: " + " | ".join(facts[:3]))
+
+    decisions = memo.get("source_decisions", [])
+    if isinstance(decisions, list):
+        decision_lines: list[str] = []
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            decision = str(item.get("decision", "")).strip()[:48]
+            if url in known_urls and decision:
+                decision_lines.append(f"{url}: {decision}")
+        if decision_lines:
+            lines.append("Source decisions: " + " | ".join(decision_lines[:3]))
+
+    return "\n".join(lines)[:max_chars]
 def strip_model_reasoning(text: str) -> str:
     """Remove visible reasoning sections before model text reaches user output."""
     if not isinstance(text, str):
@@ -1196,6 +1408,7 @@ class ResearchWorkflowNodes:
                 temperature=0,
             )
         self.llm = llm
+        self.memo_keeper_llm = self.llm.bind(max_tokens=settings.memo_keeper_max_output_tokens)
         self.board_writer_llm = self.llm.bind_tools([
             {
                 "type": "function",
@@ -1229,7 +1442,15 @@ class ResearchWorkflowNodes:
                     api_key=settings.firecrawl_api_key,
                 )
             else:
-                fetcher = DefaultWebContentFetcher()
+                cache_dir = Path(settings.web_cache_dir)
+                if not cache_dir.is_absolute():
+                    cache_dir = Path(__file__).resolve().parent / cache_dir
+                fetcher = DefaultWebContentFetcher(
+                    cache_dir=cache_dir if settings.web_cache_enabled else None,
+                    cache_ttl_seconds=settings.web_cache_ttl_seconds,
+                    min_host_interval_seconds=settings.web_host_min_interval_seconds,
+                    max_retry_after_seconds=settings.web_max_retry_after_seconds,
+                )
         elif not settings.fetch_web_content:
             fetcher = None
         self.fetcher = fetcher
@@ -1242,6 +1463,85 @@ class ResearchWorkflowNodes:
         if self.log is not None:
             self.log(message)
 
+    def log_source_trace(
+        self,
+        stage: str,
+        item: SearchResult,
+        decision: str,
+        reason: str,
+        *,
+        official_candidate: bool = False,
+    ) -> None:
+        payload = {
+            "stage": stage,
+            "url": item.url,
+            "decision": decision,
+            "reason": reason,
+            "official_candidate": official_candidate,
+            "registered_official": source_tier(item.url, self.settings.official_domains) == "primary",
+            "registered_trusted": source_tier(
+                item.url, self.settings.official_domains, self.settings.trusted_domains,
+            ) == "secondary",
+            "relevance_score": item.relevance_score,
+            "fetch_status": item.fetch_status,
+        }
+        self.log_detail(f"[SOURCE_TRACE] {json.dumps(payload, ensure_ascii=False)}")
+    def invoke_llm(
+        self,
+        role: str,
+        prompt: str,
+        *,
+        llm: Any | None = None,
+        source_count: int | None = None,
+    ) -> Any:
+        """Invoke an LLM and emit safe, structured performance metrics."""
+        client = llm or self.llm
+        started_at = time.perf_counter()
+        metric: dict[str, Any] = {
+            "role": role,
+            "input_chars": len(prompt),
+            "source_count": source_count,
+        }
+        try:
+            response = client.invoke(prompt)
+        except Exception as error:
+            metric.update({
+                "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                "status": "error",
+                "error_type": type(error).__name__,
+            })
+            self.log_detail(f"[LLM_METRIC] {json.dumps(metric, ensure_ascii=False)}")
+            raise
+
+        content = getattr(response, "content", "")
+        metric.update({
+            "duration_ms": round((time.perf_counter() - started_at) * 1000),
+            "output_chars": len(content) if isinstance(content, str) else len(str(content)),
+            "status": "completed",
+        })
+        for metadata in (
+            getattr(response, "usage_metadata", None),
+            getattr(response, "response_metadata", None),
+        ):
+            if not isinstance(metadata, dict):
+                continue
+            usage = metadata.get("token_usage", metadata.get("usage", metadata))
+            if not isinstance(usage, dict):
+                continue
+            for metric_name, keys in {
+                "input_tokens": ("input_tokens", "prompt_tokens"),
+                "output_tokens": ("output_tokens", "completion_tokens"),
+                "total_tokens": ("total_tokens",),
+            }.items():
+                if metric_name in metric:
+                    continue
+                for key in keys:
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        metric[metric_name] = value
+                        break
+        self.log_detail(f"[LLM_METRIC] {json.dumps(metric, ensure_ascii=False)}")
+        return response
     def report_progress(self, stage: str, status: str, detail: str = "") -> None:
         if self.progress is not None:
             try:
@@ -1298,45 +1598,22 @@ class ResearchWorkflowNodes:
 
     def understand_input(self, state: State):
         query = state["query"].strip()
-        prompt = f"""あなたは調査依頼の受付担当です。現在日: {self.current_date}
-ユーザーの入力だけを読み、後続の調査計画が誤解なく作れるよう依頼内容を短く整理してください。
-
-入力の意図を次の項目で日本語でまとめてください。
-- 調べたい対象と目的
-- ユーザーが知りたい観点や求める成果
-- 明示された条件・範囲・時点
-- 曖昧な点や、調査時に決めつけず確認すべき点
-
-入力にない事実や条件を補わず、推測が必要なら不明として記録してください。外部調査はまだ行わず、思考過程も出力せず、整理結果だけを最大1200文字で出力してください。
-
-ユーザーの入力:
-{query}"""
-        try:
-            understood = strip_model_reasoning(self.llm.invoke(prompt).content).strip()
-        except Exception as error:
-            understood = ""
-            self.log_detail(f"入力内容の整理に失敗しました。原文を使って続行します: {error}")
-        if not understood:
-            understood = f"モデルによる整理はできなかったため、入力原文を調査対象として扱います。\n{query}"
-        understood = understood[:1200]
-        post = f"依頼の理解: {understood} / 入力原文: {query}"
-        memo, added_posts, evicted_posts = append_run_memo_posts(
-            state.get("run_memo", ""), [post], max_chars=5000,
-        )
-        if added_posts:
-            self.log_detail("調査ボードに依頼内容の理解を記録しました:")
-            self.log_detail(f"  {added_posts[0]}")
-            if self.board_update is not None:
-                self.board_update(memo)
-        if evicted_posts:
-            self.log_detail(f"共有ボードの文字数上限により古い投稿を {evicted_posts}件整理しました")
+        understood = query[:1200]
+        memo = json.dumps({
+            "request": understood,
+            "confirmed": [],
+            "unresolved": [],
+            "source_decisions": [],
+            "next_action": "Create a research plan.",
+        }, ensure_ascii=False, separators=(",", ":"))
+        self.log_detail("入力整理: 元の質問をメモスナップショットへ記録し、LLM呼び出しを省略しました")
+        if self.board_update is not None:
+            self.board_update(memo)
         return {"understood_request": understood, "run_memo": memo}
 
     def planner(self, state: State):
         prompt = f"""あなたはリサーチプランナーです。現在日: {self.current_date}
 ユーザーの入力: {state['query']}
-入力内容の整理: {state.get('understood_request', '') or '（整理情報なし。入力原文を優先してください）'}
-
 入力内容の整理は依頼の意図を理解するための補助です。元の入力と食い違う場合は元の入力を優先し、整理に書かれていない要望を追加しないでください。重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。
 
 通常の調査計画とは別に、運営元・公式サイト・公式告知・公式文書を探すための official_queries を最大5件作ってください。検索語や検索先を少しずつ変え、公式発表・お知らせ・更新履歴・公式SNSや配信ページなど、質問に合う一次情報の入口を複数探します。検索語には「公式」「告知」「お知らせ」「公式サイト」などを含めます。対象が特定できない site: ドメインを推測して付けないでください。このレーンは一次情報を探す専用であり、見つかったページが本当に公式かは後で本文と発行元を確認します。
@@ -1361,7 +1638,7 @@ class ResearchWorkflowNodes:
 }}
 ```"""
         try:
-            response = self.llm.invoke(prompt)
+            response = self.invoke_llm("planner", prompt)
             data = parse_json_from_response(response.content)
             plan = SearchPlan.model_validate(data)
             if not plan.tasks:
@@ -1514,6 +1791,7 @@ class ResearchWorkflowNodes:
             query_candidates = rerank_results(
                 candidates, self.reranker, candidate_count, weights=weights,
                 official_domains=self.settings.official_domains,
+                trusted_domains=self.settings.trusted_domains,
             )
             if self.fetcher:
                 self.report_progress(
@@ -1525,6 +1803,7 @@ class ResearchWorkflowNodes:
                     max_length=self.settings.max_content_length,
                     fallback_fetcher=self.fallback_fetcher, weights=weights,
                     official_domains=self.settings.official_domains,
+                    trusted_domains=self.settings.trusted_domains,
                 )
             evidence_results.extend(query_candidates)
             selected_results.extend(
@@ -1579,6 +1858,7 @@ class ResearchWorkflowNodes:
         top_results = rerank_results(
             fresh_results, self.reranker, candidate_count, weights=scoring_weights,
             official_domains=self.settings.official_domains,
+            trusted_domains=self.settings.trusted_domains,
         )
         self.log_detail(f"再ランキング: {len(fresh_results)}件から上位候補 {len(top_results)}件を選択")
         if self.fetcher:
@@ -1591,6 +1871,7 @@ class ResearchWorkflowNodes:
                 fallback_fetcher=self.fallback_fetcher,
                 weights=scoring_weights,
                 official_domains=self.settings.official_domains,
+                trusted_domains=self.settings.trusted_domains,
             )
         evidence_results = top_results
         self.log_detail(f"品質評価用に本文候補 {len(evidence_results)}件を保持します")
@@ -1614,6 +1895,25 @@ class ResearchWorkflowNodes:
         unique_results = _evaluation_sources(
             all_results, official_candidates=state.get("official_results", []),
         )
+        official_urls = {item.url for item in state.get("official_results", []) if item.url}
+        evaluation_urls = {item.url for item in unique_results if item.url}
+        for item in all_results:
+            if item.url in evaluation_urls:
+                decision = "included"
+                reason = "Included in quality evaluation evidence."
+            elif item.relevance_score is None:
+                decision = "excluded"
+                reason = "Missing relevance score."
+            elif item.relevance_score < MIN_RELEVANCE_FOR_EVALUATION:
+                decision = "excluded"
+                reason = f"Relevance score below {MIN_RELEVANCE_FOR_EVALUATION:.2f}."
+            else:
+                decision = "excluded"
+                reason = "Excluded by the maximum evidence-source limit."
+            self.log_source_trace(
+                "quality_evaluation", item, decision, reason,
+                official_candidate=item.url in official_urls,
+            )
         relevance_eligible = [
             item for item in all_results
             if item.relevance_score is not None
@@ -1631,22 +1931,26 @@ class ResearchWorkflowNodes:
                 f"品質評価の入力上限と出典分散により {capped_count}件を今回の評価対象から外しました "
                 f"（評価対象上限: {MAX_EVIDENCE_SOURCES}件）"
             )
-        formatted_evidence = (
-            format_results_for_llm(unique_results)
-            if unique_results else "十分な関連度を満たす情報源はありません。"
-        )
-        prompt = f"""あなたはリサーチ品質評価担当です。現在日: {self.current_date}
+        formatted_evidence = format_results_for_llm(unique_results)[:MAX_EVALUATION_EVIDENCE_CHARS]
+        if not formatted_evidence:
+            formatted_evidence = "No eligible evidence."
+        official_evidence = format_results_for_llm(_evaluation_sources(
+            state.get("official_results", []), official_candidates=state.get("official_results", []),
+        ))[:MAX_OFFICIAL_EVALUATION_EVIDENCE_CHARS]
+        if not official_evidence:
+            official_evidence = "No official candidates."
+        brief_context = research_brief_context(state.get("run_memo", ""), evaluation_urls)
+        prompt = f"""Research brief (source-linked facts and open questions only; verify against evidence): {brief_context or "none"}
+あなたはリサーチ品質評価担当です。現在日: {self.current_date}
 質問: {state['query']}
 調査計画: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
-この調査回だけの共有ボード（これまでの投稿。根拠本文と矛盾すれば本文を優先）:
-{state.get('run_memo', '') or '（まだありません）'}
+前回までの研究ブリーフ（選定済みURLに紐付く要点のみ。根拠本文と矛盾すれば本文を優先）:
+上記の Research brief を参照
 関連度スコア {MIN_RELEVANCE_FOR_EVALUATION:.2f} 以上の検索結果およびWebページ本文（これ以外の検索結果は評価から除外済み）:
 {formatted_evidence}
 
 公式ソース専用レーンで取得した候補:
-{format_results_for_llm(_evaluation_sources(
-    state.get('official_results', []), official_candidates=state.get('official_results', [])
-)) if state.get('official_results') else '候補なし'}
+{official_evidence}
 
 評価範囲: 元の質問に答えるのに必要な情報だけを不足扱いしてください。広い「新キャラを調べて」のような依頼では、名前・公式発表かリークか・実装状況や日程の確認を中心にし、性能、育成、ガチャ確率、星声計算など依頼されていない詳細は必須条件にしないでください。
 
@@ -1689,7 +1993,7 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
         raw_evaluation = ""
         evaluation_failed = False
         try:
-            response = self.llm.invoke(prompt)
+            response = self.invoke_llm("evaluate", prompt, source_count=len(unique_results))
             raw_evaluation = response.content
             data = normalize_evaluation_payload(parse_json_from_response(raw_evaluation))
             eval_obj = Evaluation.model_validate(data)
@@ -1709,7 +2013,7 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
 
 JSON例:
 {{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"official_additional_queries":[]}}'''
-                repaired = self.llm.invoke(repair_prompt)
+                repaired = self.invoke_llm("evaluate_repair", repair_prompt, source_count=len(unique_results))
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
                 self.log_detail("品質評価の再試行に成功しました")
@@ -1807,85 +2111,85 @@ JSON例:
         board_sources = _evaluation_sources(
             all_results, official_candidates=state.get("official_results", []),
         )
-        evidence = format_results_for_llm(board_sources) if board_sources else "今回の調査では根拠ソースがありません。"
-        prompt = f"""あなたは今回の調査専用ボードの記録担当です。
-検索で新しく分かった内容を、次の検索や回答作成で再利用できる場合だけ掲示板へ記録します。
+        source_items = [
+            {
+                "url": item.url[:220],
+                "title": item.title[:120],
+                "fetch_status": item.fetch_status,
+                "decision": "selected_for_evaluation",
+                "reason": "Candidate passed the current evidence selection.",
+            }
+            for item in board_sources[:3]
+        ]
+        known_source_urls = {item["url"] for item in source_items}
+        evaluation_summary = {
+            "sufficient": evaluation.sufficient if evaluation else False,
+            "reason": (evaluation.reason if evaluation else "Not evaluated")[:240],
+            "missing_information": (evaluation.missing_information if evaluation else [])[:3],
+            "weak_evidence": (evaluation.weak_evidence if evaluation else [])[:3],
+        }
+        current_memo = (state.get("run_memo", "") or "")[-self.settings.memo_keeper_max_chars:]
+        fallback_payload = {
+            "request": state["query"][:300],
+            "confirmed": [],
+            "unresolved": [str(item)[:120] for item in evaluation_summary["missing_information"]],
+            "source_decisions": source_items,
+            "next_action": evaluation_summary["reason"],
+        }
+        memo_payload: dict[str, Any] = fallback_payload
+        if self.settings.memo_keeper_enabled:
+            prompt = f"""You are a memo keeper for one research run. Update a compact JSON memo only; do not answer the user's question.
+Keep only source-linked confirmed facts, unresolved questions, URL-level source decisions, and the next action. A confirmed fact must use a URL from Selected sources; do not invent URLs or facts. Do not include reasoning or prose outside JSON. Keep each list to at most 3 entries and the entire JSON concise.
 
-必ず write_research_board tool を1回呼び出してください。書き込む価値のある新情報がなければ、content に英小文字で正確に nothing と指定してください。nothing はアプリ側で破棄し、掲示板に保存しません。
-投稿は1件にまとめ、確認済み事実・未確認点・矛盾・訂正を明示し、可能なら出典名またはURLと日付を添えてください。既存投稿との重複、根拠のない推測、本文根拠と矛盾する断定は投稿しないでください。
+User request: {state['query'][:600]}
+Previous compact memo: {current_memo or '{}'}
+New quality evaluation: {json.dumps(evaluation_summary, ensure_ascii=False)}
+Selected sources: {json.dumps(source_items, ensure_ascii=False)}
 
-質問: {state['query']}
-調査計画: {state.get('plan')}
-既存ボード:
-{state.get('run_memo', '') or '（まだ投稿はありません）'}
-今回の品質評価:
-{evaluation}
-今回までの根拠ソース:
-{evidence}
-"""
-        post = ""
-        try:
-            response = self.board_writer_llm.invoke(prompt)
-            calls = getattr(response, "tool_calls", None) or []
-            if len(calls) == 1 and calls[0].get("name") == "write_research_board":
-                arguments = calls[0].get("args") or {}
-                if isinstance(arguments, dict) and isinstance(arguments.get("content"), str):
-                    post = arguments["content"].strip()
-                    self.log_detail("掲示板tool call: write_research_board")
-            elif not calls and hasattr(response, "content") and response.content:
-                # Fallback for models outputting JSON or plain text directly
-                content_text = strip_model_reasoning(response.content).strip()
-                try:
-                    parsed = parse_json_from_response(content_text)
-                    if isinstance(parsed, dict):
-                        if "content" in parsed and isinstance(parsed["content"], str):
-                            post = parsed["content"].strip()
-                        elif "args" in parsed and isinstance(parsed["args"], dict):
-                            post = str(parsed["args"].get("content", "")).strip()
-                        self.log_detail("掲示板JSONレスポンスから投稿内容を抽出しました")
-                except Exception:
-                    if not content_text.startswith("{") and len(content_text) <= 500:
-                        post = content_text
-                        self.log_detail("掲示板テキストレスポンスから投稿内容を採用しました")
-            else:
-                self.log_detail(f"掲示板tool callが1件ではありません（{len(calls)}件）。今回は書き込みません")
-        except Exception as error:
-            self.log_detail(f"掲示板tool callで例外が発生したためテキストで再試行します: {error}")
+Return exactly this JSON schema:
+{{"request":"","confirmed":[{{"source_url":"","note":""}}],"unresolved":[""],"source_decisions":[{{"url":"","decision":"","reason":""}}],"next_action":""}}"""
             try:
-                plain_prompt = f"""{prompt}
-※ 内部の思考過程は出力せず、以下のJSON形式のみを出力してください。
-{{"content": "掲示板に残す1件の投稿、または不要なら nothing"}}"""
-                plain_resp = self.llm.invoke(plain_prompt)
-                parsed = parse_json_from_response(strip_model_reasoning(plain_resp.content))
-                if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-                    post = parsed["content"].strip()
-                    self.log_detail("掲示板再試行から投稿内容を取得しました")
-            except Exception as fallback_error:
-                self.log_detail(f"掲示板の再試行にも失敗しました: {fallback_error}")
-                return {}
+                response = self.invoke_llm(
+                    "memo_keeper", prompt, llm=self.memo_keeper_llm, source_count=len(board_sources),
+                )
+                parsed = parse_json_from_response(strip_model_reasoning(response.content))
+                if not isinstance(parsed, dict):
+                    raise ValueError("Memo keeper response is not a JSON object")
+                memo_payload = {
+                    "request": str(parsed.get("request") or state["query"])[:300],
+                    "confirmed": [
+                        {
+                            "source_url": str(item.get("source_url", "")).strip()[:220],
+                            "note": str(item.get("note", "")).strip()[:140],
+                        }
+                        for item in parsed.get("confirmed", [])
+                        if isinstance(item, dict)
+                        and str(item.get("source_url", "")).strip() in known_source_urls
+                        and str(item.get("note", "")).strip()
+                    ][:3],
+                    "unresolved": [str(item)[:140] for item in parsed.get("unresolved", []) if str(item).strip()][:3],
+                    "source_decisions": [
+                        {
+                            "url": str(item.get("url", "")).strip()[:220],
+                            "decision": str(item.get("decision", "")).strip()[:48],
+                            "reason": str(item.get("reason", "")).strip()[:120],
+                        }
+                        for item in parsed.get("source_decisions", [])
+                        if isinstance(item, dict)
+                        and str(item.get("url", "")).strip() in known_source_urls
+                    ][:3],
+                    "next_action": str(parsed.get("next_action", ""))[:180],
+                }
+                self.log_detail("メモキーパー: 独立した短文メモを更新しました")
+            except Exception as error:
+                self.log_detail(f"メモキーパーに失敗したため決定論的メモへフォールバックしました: {type(error).__name__}")
+        memo = json.dumps(memo_payload, ensure_ascii=False, separators=(",", ":"))
+        if len(memo) > self.settings.memo_keeper_max_chars:
+            memo = json.dumps(fallback_payload, ensure_ascii=False, separators=(",", ":"))
+        if self.board_update is not None:
+            self.board_update(memo)
+        return {"run_memo": memo}
 
-        if post.casefold() == "nothing":
-            self.log_detail("掲示板tool call: nothing（追記不要のため破棄）")
-            return {}
-        if not post:
-            self.log_detail("掲示板の投稿が空だったため破棄しました")
-            return {}
-        memo, added_posts, evicted_posts = append_run_memo_posts(
-            state.get("run_memo", ""), [post], max_chars=5000,
-        )
-        if added_posts:
-            self.log_detail(f"共有ボードに新規投稿 {len(added_posts)}件:")
-            for item in added_posts:
-                self.log_detail(f"  {item}")
-        else:
-            self.log_detail("重複投稿を破棄しました")
-        if evicted_posts:
-            self.log_detail(f"共有ボードが5000文字上限に達したため、古い投稿を {evicted_posts}件整理しました")
-        if added_posts or evicted_posts:
-            if self.board_update is not None:
-                self.board_update(memo)
-            return {"run_memo": memo}
-        return {}
     def prepare_followups(self, state: State):
         evaluation = state.get("evaluation")
         if evaluation is None or evaluation.sufficient:
@@ -2006,6 +2310,7 @@ JSON例:
                 top_query_results = rerank_results(
                     query_fresh, self.reranker, candidate_count, weights=scoring_weights,
                     official_domains=self.settings.official_domains,
+                    trusted_domains=self.settings.trusted_domains,
                 )
                 if self.fetcher:
                     self.report_progress(
@@ -2020,6 +2325,7 @@ JSON例:
                         fallback_fetcher=self.fallback_fetcher,
                         weights=scoring_weights,
                         official_domains=self.settings.official_domains,
+                        trusted_domains=self.settings.trusted_domains,
                     )
                 delta_evidence_results.extend(top_query_results)
                 self.log_detail(f"品質評価用に追加検索の本文候補 {len(top_query_results)}件を保持します")
@@ -2051,7 +2357,16 @@ JSON例:
             candidate_results, official_candidates=state.get("official_results", []),
         )
         self.log_detail(f"レポート作成: 関連度と出典分散で選んだ根拠ソース {len(unique_results)}件を使用")
-        formatted_evidence = format_results_for_llm(unique_results)
+        official_urls = {item.url for item in state.get("official_results", []) if item.url}
+        final_urls = {item.url for item in unique_results if item.url}
+        for item in candidate_results:
+            self.log_source_trace(
+                "final_answer", item,
+                "included" if item.url in final_urls else "excluded",
+                "Included in final-answer evidence." if item.url in final_urls else "Excluded by final evidence selection.",
+                official_candidate=item.url in official_urls,
+            )
+        formatted_evidence = format_results_for_llm(unique_results)[:MAX_EVALUATION_EVIDENCE_CHARS]
         evaluation = state.get("evaluation")
         quality_note = ""
         if evaluation is not None and not evaluation.sufficient:
@@ -2062,13 +2377,13 @@ JSON例:
 評価理由: {evaluation.reason}
 未確認事項: {", ".join(evaluation.missing_information) or "なし"}
 レポートでは冒頭に調査が不完全であることを明記し、根拠から確認できる範囲と未確認事項を区別してください。"""
-        run_memo = (state.get("run_memo", "") or "（まだありません）")[:5000]
+        brief_context = research_brief_context(state.get("run_memo", ""), final_urls)
         answer_prompt = f"""以下のWeb検索結果および取得したWebページ本文だけを根拠に質問へ回答してください。
 現在日（この調査の基準日）: {self.current_date}
 質問: {state['query']}
 
 この調査回だけの共有ボード（過去の投稿を含む索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
-{run_memo}
+{brief_context or "none"}
 
 収集された情報源:
 {formatted_evidence}
@@ -2082,7 +2397,7 @@ JSON例:
 5. 取得情報から確認できないことは断定せず、調査品質が不十分な場合はその制約を明記してください。
 6. 元の質問で求められていない性能・育成・ガチャ詳細を必須情報のように付け加えず、公式確定情報とリーク・予想を明確に分けてください。
 7. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
-        answer = strip_model_reasoning(self.llm.invoke(answer_prompt).content)
+        answer = strip_model_reasoning(self.invoke_llm("final_answer", answer_prompt, source_count=len(unique_results)).content)
         issues = citation_issues(answer, len(unique_results))
         has_citations = bool(_SOURCE_REF_RE.search(answer))
         if unique_results and (issues or not has_citations):
@@ -2105,7 +2420,7 @@ JSON例:
 思考過程や自己対話は出力せず、修正後の回答本文だけを出力してください。<think>等のタグも含めないでください。
 調査品質が不十分な場合の注意:
 {quality_note or "特段の不足は検出されていません。"}"""
-            answer = strip_model_reasoning(self.llm.invoke(retry_prompt).content)
+            answer = strip_model_reasoning(self.invoke_llm("final_answer_citation_retry", retry_prompt, source_count=len(unique_results)).content)
         else:
             self.log_detail("出典検証: 出典番号の形式と範囲を確認しました（主張の裏付けは未検証）")
 
@@ -2159,4 +2474,3 @@ def create_workflow(
     builder.add_edge("official_additional_search", "evaluate")
     builder.add_edge("analyze", END)
     return builder.compile()
-

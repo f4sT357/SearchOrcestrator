@@ -69,7 +69,7 @@ class MainWindow(QMainWindow):
         self.model_fetch_worker: ModelFetchWorker | None = None
         self.last_results: list[SearchResult] = []
         self.default_settings = Settings.from_environment()
-        self.config_path = os.path.join(parent_dir, "config.json")
+        self.config_path = os.path.join(parent_dir, "config.local.json")
 
         self.setWindowTitle("Search Orchestrator - AI Web Research Assistant")
         self.resize(1050, 780)
@@ -158,8 +158,10 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox(self)
         self.model_combo.setEditable(True)
         self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_combo.addItem(self.default_settings.model)
-        self.model_combo.setCurrentText(self.default_settings.model)
+        self.model_combo.setPlaceholderText("LM Studioのモデルを更新または入力")
+        if self.default_settings.model:
+            self.model_combo.addItem(self.default_settings.model)
+            self.model_combo.setCurrentText(self.default_settings.model)
         self.model_combo.setToolTip(
             "調査内容を読み、検索先の案や結果のまとめを作るAIです。LM Studioで使えるモデル名を選ぶか入力してください。"
         )
@@ -194,6 +196,15 @@ class MainWindow(QMainWindow):
             "検索で見つけただけのサイトは自動登録しません。"
         )
         settings_layout.addRow("登録済み公式ドメイン:", self.official_domains_edit)
+        self.trusted_domains_edit = QLineEdit(
+            ", ".join(self.default_settings.trusted_domains), self,
+        )
+        self.trusted_domains_edit.setPlaceholderText("例: specialist.example, news.example.jp")
+        self.trusted_domains_edit.setToolTip(
+            "公式ではないものの、質問分野で信頼できる報道・専門サイトをカンマ区切りで登録します。"
+            "公式サイトより低い優先度で、検索結果の信頼度を加点します。"
+        )
+        settings_layout.addRow("信頼済み二次ソース:", self.trusted_domains_edit)
 
         # Numeric Options
         num_row = QHBoxLayout()
@@ -558,6 +569,7 @@ class MainWindow(QMainWindow):
             "trust_weight": self.trust_weight_spin.value() / 100,
             "freshness_weight": self.freshness_weight_spin.value() / 100,
             "official_domains": list(normalize_official_domains(self.official_domains_edit.text())),
+            "trusted_domains": list(normalize_official_domains(self.trusted_domains_edit.text())),
         }
         try:
             if os.path.exists(self.config_path):
@@ -596,15 +608,20 @@ class MainWindow(QMainWindow):
 
         try:
             official_domains = normalize_official_domains(self.official_domains_edit.text())
+            trusted_domains = normalize_official_domains(self.trusted_domains_edit.text())
         except ValueError as error:
             QMessageBox.warning(self, "設定エラー", str(error))
+            return
+        model = self.model_combo.currentText().strip()
+        if not model:
+            QMessageBox.warning(self, "設定エラー", "LM Studioのモデルを更新または入力してください。")
             return
 
         self._save_config()
 
         max_concurrency = self.concurrency_spin.value()
         settings = replace(self.default_settings,
-            model=self.model_combo.currentText().strip() or self.default_settings.model,
+            model=model,
             base_url=self.base_url_edit.text().strip() or self.default_settings.base_url,
             api_key=self.api_key_edit.text().strip() or self.default_settings.api_key,
             max_concurrency=max_concurrency,
@@ -626,6 +643,7 @@ class MainWindow(QMainWindow):
             trust_weight=self.trust_weight_spin.value() / 100,
             freshness_weight=self.freshness_weight_spin.value() / 100,
             official_domains=official_domains,
+            trusted_domains=trusted_domains,
         )
 
         # UI state during run
