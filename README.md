@@ -167,3 +167,18 @@ Qwen系など、プロンプト先頭または末尾の制御トークンに対�
 GUIの詳細設定では、LM Studioに渡すコンテキスト長を変更できます。既定は `65536` tokens で、設定は `config.local.json` に保存されます。`開始前にLM Studioへモデルを読み込む` を有効にすると、調査開始時にネイティブAPIで選択モデルのロード状態を確認し、コンテキスト長が異なる場合だけその選択モデルを再ロードします。別のロード済みモデルは変更しません。
 
 ロード成功時にLM Studioが返した実際のコンテキスト長を検証します。一致しない場合、調査は開始せずにエラーを表示します。VRAM不足時はコンテキスト長を下げるか、不要なモデルをLM Studio側でアンロードしてください。
+
+## ライセンスとGUI配布
+
+本体は Apache-2.0 です。デスクトップ GUI を配布する場合は、配布物に
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) と
+[`LICENSES/LGPL-3.0.txt`](LICENSES/LGPL-3.0.txt) を同梱してください。PySide6/Qt
+は LGPL-3.0 の条件で利用しており、Qt の DLL を共有ライブラリとして配布し、
+静的リンクしないでください。Firecrawl セルフホスト機能は任意の外部コンポーネントであり、
+その本体を製品に同梱する場合は別途 AGPL-3.0 の義務を確認してください。
+
+ビルド後の配布フォルダには、次を実行して通知ファイルをコピーできます。
+
+```powershell
+.\scripts\Add-GuiLicenseNotices.ps1 -DistributionPath .\dist\SearchOrchestrator
+```
