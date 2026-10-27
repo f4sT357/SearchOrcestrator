@@ -182,3 +182,17 @@ GUIの詳細設定では、LM Studioに渡すコンテキスト長を変更で�
 ```powershell
 .\scripts\Add-GuiLicenseNotices.ps1 -DistributionPath .\dist\SearchOrchestrator
 ```
+
+### Windows 配布フォルダの再生成
+
+開発環境で次を実行すると、PySide6/Qt、再ランキング用の PyTorch と
+Sentence Transformers、設定ファイル、ライセンス通知を含むフォルダ形式の
+Windows 配布物を `dist\SearchOrchestrator` に生成します。Qt DLL は共有
+ライブラリのまま保持されます。
+
+```powershell
+.\scripts\Build-GuiRelease.ps1
+```
+
+PyInstaller は `requirements-dev.txt` に含まれています。配布物を渡す際は
+`dist\SearchOrchestrator` フォルダ全体を渡してください。
