@@ -83,7 +83,7 @@ python main.py --content-fetcher firecrawl --firecrawl-url "http://localhost:300
 内蔵の本文取得では、同一URLを実行内・実行間で再利用します。既定では `.cache/web-content` にURLをSHA-256でハッシュ化したキャッシュを保存し、6時間以内は通信せず再利用します。期限後は `ETag` / `Last-Modified` があれば条件付きGETで再検証し、`304 Not Modified` では本文を再利用します。`Cache-Control: no-store` は保存せず、サーバー指定の `max-age` を尊重します。ホストごとの取得は1件ずつにし、`429` の `Retry-After` は最大30秒待機して1回だけ再試行します。`config.json` または `config.local.json` では `web_cache_enabled`、`web_cache_ttl_seconds`、`web_cache_dir`、`web_host_min_interval_seconds`、`web_max_retry_after_seconds` を変更できます。
 ### Firecrawl セルフホストを本文取得に使う
 
-Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。→まだ同梱していません
+Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。
 
 API は `http://localhost:3002` で、この PC からだけ接続できます。GUI の詳細設定で本文取得エンジンを「Firecrawl セルフホスト」に変更し、API URL を指定します。API キーは `FIRECRAWL_API_KEY` 環境変数から読み込み、GUI の設定ファイルには保存しません。CLI では `--content-fetcher firecrawl` と `--firecrawl-url` を指定できます。
 
