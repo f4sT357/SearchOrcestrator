@@ -2,6 +2,18 @@
 
 ローカルの OpenAI 互換 API、DuckDuckGo 検索、および **Webサイト本文の自動取得（Web Fetching / Scraping）** を使い、調査計画、Web検索、再ランキング、Web本文抽出、品質評価、追加検索、高品質な回答生成を自律的に行う Python アプリケーションです。
 
+## ブランチについて
+
+以下は2026年10月27日時点の一覧です。最新の状態は [GitHubのブランチ一覧](https://github.com/f4sT357/SearchOrcestrator/branches) を確認してください。
+
+| ブランチ | 内容・状態 |
+| --- | --- |
+| [main](https://github.com/f4sT357/SearchOrcestrator/tree/main) | 基準となるブランチ。 |
+| [fix/research-workflow-maintainability](https://github.com/f4sT357/SearchOrcestrator/tree/fix/research-workflow-maintainability) | 追加検索の重複除外、GUI設定の引き継ぎ、品質評価と最終回答の根拠の整合性などを修正。mainには未反映。変更箇所の模擬テストは実施済みだが、依存ライブラリを使った既存テストとGUIの統合テストは未実施。 |
+| [auto/improve-search-workflow-20260914](https://github.com/f4sT357/SearchOrcestrator/tree/auto/improve-search-workflow-20260914) | 検索ワークフロー改善用のブランチ。mainとの差分と現在の利用状況は要確認。 |
+
+変更ブランチをmainに取り込む前に、差分を確認し、依存関係を用意して `pytest -v` を実行してください。GUIや実際の検索に影響する変更は、該当機能の動作も確認します。
+
 ## 主な特徴
 - **自律的リサーチワークフロー (LangGraph)**: 最初に依頼内容を整理して共有ボードへ記録し、その理解に基づいて調査計画を立案・並列検索
 - **CrossEncoder による再ランキング**: 検索結果を高精度にスコアリングして関連度の高いソースを選定
