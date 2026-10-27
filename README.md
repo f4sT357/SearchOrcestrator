@@ -196,3 +196,7 @@ Windows 配布物を `dist\SearchOrchestrator` に生成します。Qt DLL は�
 
 PyInstaller は `requirements-dev.txt` に含まれています。配布物を渡す際は
 `dist\SearchOrchestrator` フォルダ全体を渡してください。
+
+## はじめて使う方へ
+
+配布版を初めて使う場合は、[はじめてガイド](USER_GUIDE_JA.md) を参照してください。

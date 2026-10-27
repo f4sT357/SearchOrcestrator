@@ -21,6 +21,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $distribution = Join-Path $dist 'SearchOrchestrator'
+Copy-Item -LiteralPath (Join-Path $projectRoot 'USER_GUIDE_JA.md') -Destination (Join-Path $distribution 'はじめてガイド.md') -Force
 & (Join-Path $PSScriptRoot 'Add-GuiLicenseNotices.ps1') -DistributionPath $distribution
 if ($LASTEXITCODE -ne 0) {
     throw "License notice copy failed with exit code $LASTEXITCODE"
