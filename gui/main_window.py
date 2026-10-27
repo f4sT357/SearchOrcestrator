@@ -80,12 +80,11 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_stylesheet()
 
-        self._reranker_preload_signals = RerankerPreloadSignals(self)
-        self._reranker_preload_signals.ready.connect(self._on_reranker_preloaded)
-        self._reranker_preload_signals.failed.connect(self._on_reranker_preload_failed)
-        self.status_label.setText("CrossEncoderをバックグラウンドで準備中...")
-        self._log("GUI起動後のバックグラウンドでCrossEncoderを読み込みます")
-        preload_reranker_background(self.default_settings.reranker_model, self._reranker_preload_signals)
+        # Loading the CrossEncoder starts native PyTorch code. Defer it to the
+        # research worker so application startup remains reliable and the GUI
+        # event loop is never coupled to a best-effort optimization.
+        self.status_label.setText("待機中")
+        self._log("CrossEncoderは調査開始時にバックグラウンドで読み込みます")
 
         # Fetch models once on application startup as requested
         self._refresh_model_list(show_feedback=False)

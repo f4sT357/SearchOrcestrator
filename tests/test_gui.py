@@ -19,7 +19,8 @@ from search_orchestrator import Settings
 
 def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("gui.main_window.Settings.from_environment", lambda: Settings())
-    monkeypatch.setattr("gui.main_window.preload_reranker_background", lambda *_args: None)
+    preload_calls = []
+    monkeypatch.setattr("gui.main_window.preload_reranker_background", lambda *_args: preload_calls.append(_args))
     monkeypatch.setattr(MainWindow, "_refresh_model_list", lambda *_args, **_kwargs: None)
     app = QApplication.instance()
     if app is None:
@@ -49,6 +50,7 @@ def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     assert saved_config["content_fetcher"] == "builtin"
     assert saved_config["firecrawl_api_url"] == "http://localhost:3002"
     assert "firecrawl_api_key" not in saved_config
+    assert preload_calls == []
     window.close()
 
 
