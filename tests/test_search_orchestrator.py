@@ -3,6 +3,7 @@ from datetime import date
 import json
 import pytest
 import httpx
+import app_settings
 import search_orchestrator as orchestrator
 
 from search_orchestrator import (
@@ -220,7 +221,7 @@ def test_settings_loads_local_config_after_shared_config_and_before_environment(
     (tmp_path / "config.local.json").write_text(json.dumps({
         "model": "local-model", "max_search_queries": 6, "trusted_domains": ["specialist.example"],
     }), encoding="utf-8")
-    monkeypatch.setattr(orchestrator, "__file__", str(tmp_path / "search_orchestrator.py"))
+    monkeypatch.setattr(app_settings, "__file__", str(tmp_path / "app_settings.py"))
     monkeypatch.delenv("SEARCH_MODEL", raising=False)
 
     local_settings = Settings.from_environment()
@@ -532,6 +533,21 @@ def test_settings_validate_scoring_weight_sum() -> None:
         assert "sum to 1" in str(error)
     else:
         raise AssertionError("invalid scoring weights should be rejected")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("results_per_query", 0),
+        ("reranked_results_per_query", 0),
+        ("content_candidate_results_per_query", -1),
+        ("fetch_timeout", 0),
+        ("fetch_timeout", float("inf")),
+    ],
+)
+def test_settings_reject_invalid_fetch_limits(field_name: str, value: float) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        Settings(**{field_name: value})
 
 
 def test_page_date_can_promote_a_candidate_before_final_selection() -> None:
