@@ -121,6 +121,10 @@ def main(argv: list[str] | None = None) -> None:
         official_domains=settings.official_domains,
         trusted_domains=settings.trusted_domains,
     )
+    if not settings.model.strip():
+        parser.error(
+            "LLM\u30e2\u30c7\u30eb\u540d\u304c\u672a\u8a2d\u5b9a\u3067\u3059\u3002--model\u3001SEARCH_MODEL\u3001\u307e\u305f\u306fconfig.local.json\u3067\u6307\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044"
+        )
 
     def cli_log(message: str) -> None:
         if args.verbose and not args.quiet:

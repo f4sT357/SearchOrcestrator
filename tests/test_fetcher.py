@@ -271,6 +271,7 @@ class TestPopulateContent:
         out = populate_content(results, primary, fallback_fetcher=fallback)
         assert out[0].content is None
         assert out[0].fetch_status == FetchStatus.EMPTY_OR_FAILED.value
+        assert out[0].fetch_error == "primary=http_521; fallback=timeout"
 
     def test_no_fallback_fetcher_primary_fails(self):
         primary = MagicMock()
@@ -279,6 +280,7 @@ class TestPopulateContent:
         out = populate_content(results, primary, fallback_fetcher=None)
         assert out[0].content is None
         assert out[0].fetch_status == FetchStatus.EMPTY_OR_FAILED.value
+        assert out[0].fetch_error == "primary=http_521"
 
     def test_use_fallback_fetcher_false_skips_fallback(self):
         """When fallback_fetcher=None (simulating use_fallback_fetcher=False),

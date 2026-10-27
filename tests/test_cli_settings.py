@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import sys
 from unittest.mock import MagicMock
+import pytest
 
 import main as cli
 from search_orchestrator import Settings
@@ -10,6 +11,7 @@ from search_orchestrator import Settings
 
 def test_cli_options_override_loaded_settings(monkeypatch) -> None:
     loaded = Settings(
+        model="test-model",
         max_concurrency=4,
         max_search_queries=11,
         max_search_rounds=4,
@@ -47,3 +49,13 @@ def test_cli_options_override_loaded_settings(monkeypatch) -> None:
     workflow.invoke.assert_called_once()
     assert workflow.invoke.call_args.args[0]["query"] == "調査テーマ"
     assert workflow.invoke.call_args.args[1] == {"max_concurrency": 3}
+
+
+def test_cli_requires_a_model(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Settings, "from_environment", classmethod(lambda cls: Settings()))
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["query"])
+
+    assert error.value.code == 2
+    assert "LLM\u30e2\u30c7\u30eb\u540d\u304c\u672a\u8a2d\u5b9a" in capsys.readouterr().err

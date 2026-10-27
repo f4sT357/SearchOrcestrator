@@ -14,6 +14,7 @@ parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
+from lmstudio_client import ensure_lmstudio_model_loaded, fetch_lmstudio_model_keys
 from search_orchestrator import Settings, create_workflow, preload_reranker, fetch_available_models
 
 
@@ -75,7 +76,9 @@ class ModelFetchRunnable(QRunnable):
 
     def run(self) -> None:
         try:
-            models = fetch_available_models(base_url=self.base_url, api_key=self.api_key, timeout=3.0)
+            models = fetch_lmstudio_model_keys(
+                openai_base_url=self.base_url, api_key=self.api_key, timeout=3.0,
+            ) or fetch_available_models(base_url=self.base_url, api_key=self.api_key, timeout=3.0)
             try:
                 self.signals.models_fetched.emit(models, self.show_feedback)
             except RuntimeError:
@@ -86,6 +89,41 @@ class ModelFetchRunnable(QRunnable):
             except RuntimeError:
                 pass
 
+class ModelLoadSignals(QObject):
+    loaded = Signal(str, str, int, bool)
+    load_failed = Signal(str)
+
+
+class ModelLoadRunnable(QRunnable):
+    """Load one LM Studio model without blocking the GUI event loop."""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__()
+        self.signals = ModelLoadSignals()
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            loaded = ensure_lmstudio_model_loaded(
+                openai_base_url=self.settings.base_url,
+                model_key=self.settings.model,
+                context_length=self.settings.lmstudio_context_length,
+                api_key=self.settings.api_key,
+            )
+            try:
+                self.signals.loaded.emit(
+                    loaded.model_key,
+                    loaded.instance_id,
+                    loaded.context_length,
+                    loaded.reused_existing,
+                )
+            except RuntimeError:
+                pass
+        except Exception as exc:
+            try:
+                self.signals.load_failed.emit(str(exc))
+            except RuntimeError:
+                pass
 
 def _fetch_settings_summary(settings: Settings) -> str:
     """Describe the effective body-fetch configuration without exposing secrets."""

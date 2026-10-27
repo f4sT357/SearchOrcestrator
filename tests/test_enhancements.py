@@ -142,7 +142,7 @@ def test_update_board_fallback_when_tool_call_is_text_json() -> None:
 
 
 def test_cli_verbosity_and_quiet_options(monkeypatch) -> None:
-    loaded = Settings()
+    loaded = Settings(model="test-model")
     monkeypatch.setattr(Settings, "from_environment", classmethod(lambda cls: loaded))
     workflow = MagicMock()
     workflow.invoke.return_value = {"summary": "Completed report"}

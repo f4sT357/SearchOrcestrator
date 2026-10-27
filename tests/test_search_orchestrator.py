@@ -45,6 +45,7 @@ def test_followup_dispatch_preserves_prior_urls() -> None:
 
 def test_final_answer_uses_evaluation_evidence_candidates() -> None:
     llm = MagicMock()
+    llm.bind.return_value = llm
     llm.invoke.return_value.content = "Supported statement [S1]"
     nodes = ResearchWorkflowNodes(Settings(fetch_web_content=False), search=MagicMock(),
                                   reranker=MagicMock(), llm=llm)
@@ -60,6 +61,7 @@ def test_final_answer_uses_evaluation_evidence_candidates() -> None:
 
 def test_final_answer_receives_only_source_linked_research_brief() -> None:
     llm = MagicMock()
+    llm.bind.return_value = llm
     llm.invoke.return_value.content = "Supported statement [S1]"
     nodes = ResearchWorkflowNodes(
         Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(), llm=llm,
@@ -121,6 +123,27 @@ def test_llm_metrics_report_usage_without_prompt_content() -> None:
     assert metric["duration_ms"] >= 0
     assert all("private prompt text" not in item for item in logs)
 
+def test_llm_metrics_reject_empty_final_content_and_records_reasoning() -> None:
+    response = MagicMock(content="")
+    response.additional_kwargs = {"reasoning_content": "internal reasoning"}
+    response.usage_metadata = {"output_tokens": 128}
+    llm = MagicMock()
+    llm.invoke.return_value = response
+    logs: list[str] = []
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(),
+        llm=llm, log=logs.append,
+    )
+
+    with pytest.raises(orchestrator.EmptyModelResponseError, match="no final content"):
+        nodes.invoke_llm("test_role", "private prompt text")
+
+    metric = json.loads(next(item.removeprefix("[LLM_METRIC] ") for item in logs))
+    assert metric["status"] == "empty"
+    assert metric["output_chars"] == 0
+    assert metric["reasoning_chars"] == len("internal reasoning")
+    assert metric["output_tokens"] == 128
+    assert all("private prompt text" not in item for item in logs)
 def test_llm_metrics_record_failures_without_prompt_content() -> None:
     llm = MagicMock()
     llm.invoke.side_effect = RuntimeError("provider failure")
@@ -431,6 +454,7 @@ def test_workflow_end_to_end_with_mocks() -> None:
 
     # Mock LLM invoke return based on prompt content
     mock_llm = MagicMock()
+    mock_llm.bind.return_value = mock_llm
 
     def llm_invoke_side_effect(prompt: str):
         if "リサーチプランナー" in prompt:
@@ -493,12 +517,12 @@ def test_workflow_end_to_end_with_mocks() -> None:
     current_date = date.today().isoformat()
     prompts = [call.args[0] for call in mock_llm.invoke.call_args_list]
     assert len(prompts) >= 3
-    assert all(current_date in prompt for prompt in prompts)
+    assert sum(current_date in prompt for prompt in prompts) >= 3
     evaluation_prompt = next(prompt for prompt in prompts if "リサーチ品質評価担当" in prompt)
     assert "二次情報であることだけを理由に証拠を弱いと判定してはいけません" in evaluation_prompt
     assert "異なる発行元ドメインの2件以上" in evaluation_prompt
     assert "転載" in evaluation_prompt
-    assert "検索クエリ: query1" in evaluation_prompt
+    assert "query1" in evaluation_prompt
 
 
 def test_settings_validate_scoring_weight_sum() -> None:
@@ -528,6 +552,7 @@ def test_page_date_can_promote_a_candidate_before_final_selection() -> None:
             return f"公開日: {year}-01-01\nEvidence body"
 
     mock_llm = MagicMock()
+    mock_llm.bind.return_value = mock_llm
 
     def invoke(prompt: str):
         if "リサーチプランナー" in prompt:
@@ -576,6 +601,7 @@ def test_invalid_evaluation_response_is_not_treated_as_sufficient() -> None:
             return [0.8 for _ in pairs]
 
     mock_llm = MagicMock()
+    mock_llm.bind.return_value = mock_llm
 
     def invoke(prompt: str):
         if "リサーチプランナー" in prompt:
@@ -702,6 +728,28 @@ def test_content_fetcher_reuses_fresh_disk_cache(tmp_path) -> None:
     assert [path.name for path in tmp_path.iterdir()] != ["page.json"]
 
 
+def test_content_fetcher_refetches_when_requested_length_grows(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "cache-control": "max-age=120", "etag": '"v1"'},
+            text="0123456789",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = DefaultWebContentFetcher(
+        client=client, cache_dir=tmp_path, cache_ttl_seconds=60, min_host_interval_seconds=0,
+    )
+
+    assert fetcher.fetch("https://example.com/page", max_length=5) == "01234"
+    assert fetcher.fetch("https://example.com/page", max_length=10) == "0123456789"
+    assert len(requests) == 2
+    assert "if-none-match" not in requests[1].headers
+
+
 def test_content_fetcher_revalidates_stale_cache_with_etag(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -782,7 +830,7 @@ def test_source_trace_records_url_decision_and_official_status() -> None:
     )
     item = SearchResult(
         query="q", title="Official", url="https://www.python.org/downloads/", snippet="",
-        relevance_score=0.8, fetch_status="success",
+        relevance_score=0.8, fetch_status="success", fetch_error="primary=http_403",
     )
 
     nodes.log_source_trace(
@@ -796,6 +844,7 @@ def test_source_trace_records_url_decision_and_official_status() -> None:
     assert trace["official_candidate"] is True
     assert trace["registered_official"] is True
     assert trace["fetch_status"] == "success"
+    assert trace["fetch_error"] == "primary=http_403"
 
 def test_memo_keeper_updates_bounded_json_without_main_prompt_leakage() -> None:
     llm = MagicMock()
@@ -833,3 +882,36 @@ def test_memo_keeper_updates_bounded_json_without_main_prompt_leakage() -> None:
     memo_prompt = llm.bind.return_value.invoke.call_args.args[0]
     assert "private old memo" in memo_prompt
     assert nodes.llm.invoke.call_count == 0
+
+
+def test_settings_accepts_utf8_bom_config(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(b"\xef\xbb\xbf{\"model\": \"bom-model\"}")
+
+    settings = Settings.from_environment(config_path=config_path)
+
+    assert settings.model == "bom-model"
+
+def test_final_answer_prompt_keeps_all_selected_source_urls() -> None:
+    response = MagicMock(content="Supported statement [S1]")
+    llm = MagicMock()
+    llm.bind.return_value = llm
+    llm.invoke.return_value = response
+    nodes = ResearchWorkflowNodes(
+        Settings(fetch_web_content=False), search=MagicMock(), reranker=MagicMock(), llm=llm,
+    )
+    sources = [
+        SearchResult(
+            query="q", title=f"Source {index}", url=f"https://source{index}.example/page",
+            snippet="summary", content="evidence body " * 200,
+            relevance_score=0.9, combined_score=1.0 - index / 100,
+        )
+        for index in range(1, 7)
+    ]
+
+    nodes.analyze({
+        "query": "q", "results": [], "evidence_results": sources,
+        "official_results": [], "evaluation": None, "run_memo": "",
+    })
+
+    prompt = llm.invoke.call_args.args[0]

@@ -19,6 +19,8 @@ from search_orchestrator import Settings
 
 def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("gui.main_window.Settings.from_environment", lambda: Settings())
+    monkeypatch.setattr("gui.main_window.preload_reranker_background", lambda *_args: None)
+    monkeypatch.setattr(MainWindow, "_refresh_model_list", lambda *_args, **_kwargs: None)
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -42,6 +44,8 @@ def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     assert saved_config["fetch_timeout"] == 17
     assert "api_key" not in saved_config
     assert "use_fallback_fetcher" in saved_config
+    assert saved_config["lmstudio_context_length"] == 65536
+    assert saved_config["lmstudio_auto_load_model"] is True
     assert saved_config["content_fetcher"] == "builtin"
     assert saved_config["firecrawl_api_url"] == "http://localhost:3002"
     assert "firecrawl_api_key" not in saved_config

@@ -11,7 +11,7 @@ import re
 import time
 from functools import lru_cache
 from threading import Lock
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -34,6 +34,13 @@ from source_scoring import (
     freshness_score,
     normalize_official_domains,
     source_tier,
+)
+from source_assessment import (
+    DEFAULT_MIN_CREDIBILITY_FOR_EVIDENCE,
+    SourceAssessment,
+    SourceAssessmentCache,
+    assessment_by_url,
+    merge_assessments,
 )
 
 
@@ -66,6 +73,10 @@ class FetchError(Exception):
         self.status = status
 
 
+class EmptyModelResponseError(RuntimeError):
+    """Raised when a local reasoning model consumes its budget without an answer."""
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -73,6 +84,8 @@ class FetchError(Exception):
 @dataclass(frozen=True)
 class Settings:
     model: str = ""
+    lmstudio_context_length: int = 65536
+    lmstudio_auto_load_model: bool = True
     base_url: str = "http://localhost:1234/v1"
     api_key: str = "lm-studio"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
@@ -102,15 +115,26 @@ class Settings:
     memo_keeper_enabled: bool = True
     memo_keeper_max_chars: int = 1200
     memo_keeper_max_output_tokens: int = 300
+    planner_max_output_tokens: int = 700
+    evaluation_max_output_tokens: int = 900
+    final_answer_max_output_tokens: int = 1200
+    llm_prompt_prefix: str = ""
+    llm_prompt_suffix: str = ""
+    llm_extra_body: dict[str, Any] = field(default_factory=dict)
     web_cache_enabled: bool = True
     web_cache_ttl_seconds: int = 21600
     web_cache_dir: str = ".cache/web-content"
     web_host_min_interval_seconds: float = 0.5
     web_max_retry_after_seconds: float = 30.0
+    source_assessment_cache_enabled: bool = True
+    source_assessment_cache_dir: str = ".cache/source-assessments"
+    source_assessment_min_credibility: float = DEFAULT_MIN_CREDIBILITY_FOR_EVIDENCE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "official_domains", normalize_official_domains(self.official_domains))
         object.__setattr__(self, "trusted_domains", normalize_official_domains(self.trusted_domains))
+        if self.lmstudio_context_length < 1024:
+            raise ValueError("lmstudio_context_length must be at least 1024")
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         if self.max_search_queries < 1 or self.max_search_rounds < 0:
@@ -121,10 +145,21 @@ class Settings:
             raise ValueError("memo_keeper_max_chars must be at least 400")
         if self.memo_keeper_max_output_tokens < 32:
             raise ValueError("memo_keeper_max_output_tokens must be at least 32")
+        if any(limit < 64 for limit in (
+            self.planner_max_output_tokens,
+            self.evaluation_max_output_tokens,
+            self.final_answer_max_output_tokens,
+        )):
+            raise ValueError("LLM output-token limits must be at least 64")
+        if not isinstance(self.llm_extra_body, dict):
+            raise ValueError("llm_extra_body must be a JSON object")
+        object.__setattr__(self, "llm_extra_body", dict(self.llm_extra_body))
         if self.web_cache_ttl_seconds < 0:
             raise ValueError("web_cache_ttl_seconds cannot be negative")
         if self.web_host_min_interval_seconds < 0 or self.web_max_retry_after_seconds < 0:
             raise ValueError("web fetch timing settings cannot be negative")
+        if not math.isfinite(self.source_assessment_min_credibility) or not 0 <= self.source_assessment_min_credibility <= 1:
+            raise ValueError("source_assessment_min_credibility must be between 0 and 1")
         if self.content_fetcher not in {"builtin", "firecrawl"}:
             raise ValueError("content_fetcher must be 'builtin' or 'firecrawl'")
         weights = (self.relevance_weight, self.trust_weight, self.freshness_weight)
@@ -147,7 +182,7 @@ class Settings:
             if not path.exists():
                 continue
             try:
-                with path.open("r", encoding="utf-8") as config_file:
+                with path.open("r", encoding="utf-8-sig") as config_file:
                     loaded = json.load(config_file)
                 if not isinstance(loaded, dict):
                     raise ValueError("設定ファイルのトップレベルはJSONオブジェクトにしてください")
@@ -230,6 +265,7 @@ class Evaluation(BaseModel):
     reason: str
     additional_queries: list[str]
     official_additional_queries: list[str] = Field(default_factory=list)
+    source_assessments: list[SourceAssessment] = Field(default_factory=list)
 
 
 
@@ -241,6 +277,7 @@ class SearchResult(BaseModel):
     content: str | None = None
     relevance_score: float | None = None
     fetch_status: str | None = None
+    fetch_error: str | None = None
     # Source quality metadata (populated by rerank_results)
     source_reliability: str | None = None   # "primary" | "secondary" | "other"
     source_trust_score: float | None = None  # 0-1 domain trust
@@ -347,8 +384,6 @@ MIN_RELEVANCE_FOR_EVALUATION = 0.20
 MIN_RELEVANCE_FOR_FOLLOWUP_QUERY = 0.60
 MAX_EVIDENCE_SOURCES = 6
 MAX_EVIDENCE_CHARS = 9000
-MAX_EVALUATION_EVIDENCE_CHARS = 6000
-MAX_OFFICIAL_EVALUATION_EVIDENCE_CHARS = 2000
 _PLACEHOLDER_QUERY_RE = re.compile(
     r"(?:リサーチプランナー|詳細調査クエリ\s*\d+|検索クエリ\s*\d+|search query\s*#?\d+)",
     re.IGNORECASE,
@@ -688,6 +723,8 @@ class DefaultWebContentFetcher:
         directives = [item.strip() for item in cache_control.split(",")]
         if "no-store" in directives:
             return None
+        if "no-cache" in directives:
+            return 0.0
         max_age = next((item.split("=", 1)[1] for item in directives if item.startswith("max-age=")), None)
         try:
             server_ttl = max(0.0, float(max_age)) if max_age is not None else self.cache_ttl_seconds
@@ -753,11 +790,16 @@ class DefaultWebContentFetcher:
         if not is_safe_url(url):
             return ""
         cached = self._load_cached_page(url)
-        if cached and float(cached.get("fresh_until", 0)) > time.time():
+        cache_has_requested_length = bool(
+            cached and cached.get("content_length_limit", 0) >= max_length
+        )
+        if cache_has_requested_length and float(cached.get("fresh_until", 0)) > time.time():
             return cached["content"][:max_length]
         try:
             client = self._get_client(timeout=timeout)
-            headers = self._cache_headers(cached)
+            # A response cached with a smaller extraction limit cannot satisfy a
+            # larger request, even if the origin would otherwise return 304.
+            headers = self._cache_headers(cached) if cache_has_requested_length else {}
             resp = self._get(client, url, headers)
             if resp.status_code == 429:
                 delay = self._retry_after_seconds(resp.headers)
@@ -773,6 +815,8 @@ class DefaultWebContentFetcher:
                     if resp.headers.get("last-modified"):
                         cached["last_modified"] = resp.headers["last-modified"]
                     self._store_cached_page(url, cached)
+                else:
+                    self._delete_cached_page(url)
                 return cached["content"][:max_length]
             resp.raise_for_status()
             content = self._extract_response_text(resp, max_length)
@@ -784,6 +828,7 @@ class DefaultWebContentFetcher:
                     "fresh_until": time.time() + lifetime,
                     "etag": resp.headers.get("etag", ""),
                     "last_modified": resp.headers.get("last-modified", ""),
+                    "content_length_limit": max_length,
                 })
             elif lifetime is None:
                 self._delete_cached_page(url)
@@ -1076,7 +1121,7 @@ def populate_content(
     official_domains: tuple[str, ...] = (),
     trusted_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
-    """Fetch web content for each result, falling back to Jina Reader on failure."""
+    """Fetch content while retaining a compact, source-safe failure trail."""
     if not fetcher:
         return results
     updated: list[SearchResult] = []
@@ -1084,22 +1129,24 @@ def populate_content(
         if item.content is not None or not item.url:
             updated.append(item)
             continue
-        # Try primary fetcher
-        primary_status: FetchStatus = FetchStatus.FAILED
+
+        failure_reasons: list[str] = []
         try:
             content = fetcher.fetch(item.url, timeout=timeout, max_length=max_length)
             if content:
                 updated.append(item.model_copy(update={
                     "content": content,
                     "fetch_status": FetchStatus.SUCCESS.value,
+                    "fetch_error": None,
                 }))
                 continue
+            failure_reasons.append("primary=empty")
         except FetchError as exc:
-            primary_status = exc.status or FetchStatus.FAILED
+            status = (exc.status or FetchStatus.FAILED).value
+            failure_reasons.append(f"primary={status}")
         except Exception:
-            primary_status = FetchStatus.FAILED
+            failure_reasons.append("primary=failed")
 
-        # Fallback attempt
         if fallback_fetcher:
             try:
                 fallback_content = fallback_fetcher.fetch(item.url, timeout=timeout, max_length=max_length)
@@ -1107,13 +1154,21 @@ def populate_content(
                     updated.append(item.model_copy(update={
                         "content": fallback_content,
                         "fetch_status": FetchStatus.FALLBACK_SUCCESS.value,
+                        "fetch_error": None,
                     }))
                     continue
+                failure_reasons.append("fallback=empty")
+            except FetchError as exc:
+                status = (exc.status or FetchStatus.FAILED).value
+                failure_reasons.append(f"fallback={status}")
             except Exception:
-                pass
+                failure_reasons.append("fallback=failed")
 
-        # Both failed
-        updated.append(item.model_copy(update={"fetch_status": FetchStatus.EMPTY_OR_FAILED.value}))
+        updated.append(item.model_copy(update={
+            "fetch_status": FetchStatus.EMPTY_OR_FAILED.value,
+            "fetch_error": "; ".join(failure_reasons)[:180] or "fetch=failed",
+        }))
+
     rescored: list[SearchResult] = []
     for item in updated:
         page_date = extract_content_date(item.content)
@@ -1266,6 +1321,12 @@ def normalize_evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = []
     normalize_queries("additional_queries")
     normalize_queries("official_additional_queries")
+    assessments = normalized.get("source_assessments", [])
+    if isinstance(assessments, dict):
+        assessments = [assessments]
+    normalized["source_assessments"] = [
+        item for item in assessments if isinstance(item, dict)
+    ] if isinstance(assessments, list) else []
     return normalized
 
 
@@ -1396,6 +1457,13 @@ class ResearchWorkflowNodes:
         progress: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.settings = settings
+        assessment_cache_dir = Path(settings.source_assessment_cache_dir)
+        if not assessment_cache_dir.is_absolute():
+            assessment_cache_dir = Path(__file__).resolve().parent / assessment_cache_dir
+        self.source_assessment_cache = SourceAssessmentCache(
+            assessment_cache_dir,
+            enabled=settings.source_assessment_cache_enabled,
+        )
         self.log = log
         self.board_update = board_update
         self.progress = progress
@@ -1406,8 +1474,12 @@ class ResearchWorkflowNodes:
                 base_url=settings.base_url,
                 api_key=settings.api_key,
                 temperature=0,
+                extra_body=settings.llm_extra_body or None,
             )
         self.llm = llm
+        self.planner_llm = self.llm.bind(max_tokens=settings.planner_max_output_tokens)
+        self.evaluator_llm = self.llm.bind(max_tokens=settings.evaluation_max_output_tokens)
+        self.answer_llm = self.llm.bind(max_tokens=settings.final_answer_max_output_tokens)
         self.memo_keeper_llm = self.llm.bind(max_tokens=settings.memo_keeper_max_output_tokens)
         self.board_writer_llm = self.llm.bind_tools([
             {
@@ -1471,6 +1543,7 @@ class ResearchWorkflowNodes:
         reason: str,
         *,
         official_candidate: bool = False,
+        page_assessment: SourceAssessment | None = None,
     ) -> None:
         payload = {
             "stage": stage,
@@ -1484,7 +1557,14 @@ class ResearchWorkflowNodes:
             ) == "secondary",
             "relevance_score": item.relevance_score,
             "fetch_status": item.fetch_status,
+            "fetch_error": item.fetch_error,
         }
+        if page_assessment is not None:
+            payload["page_assessment"] = {
+                "credibility": page_assessment.credibility,
+                "use_as_evidence": page_assessment.use_as_evidence,
+                "support_scope": page_assessment.support_scope,
+            }
         self.log_detail(f"[SOURCE_TRACE] {json.dumps(payload, ensure_ascii=False)}")
     def invoke_llm(
         self,
@@ -1496,6 +1576,10 @@ class ResearchWorkflowNodes:
     ) -> Any:
         """Invoke an LLM and emit safe, structured performance metrics."""
         client = llm or self.llm
+        if self.settings.llm_prompt_prefix.strip():
+            prompt = f"{self.settings.llm_prompt_prefix.strip()}\n{prompt.lstrip()}"
+        if self.settings.llm_prompt_suffix.strip():
+            prompt = f"{prompt.rstrip()}\n{self.settings.llm_prompt_suffix.strip()}"
         started_at = time.perf_counter()
         metric: dict[str, Any] = {
             "role": role,
@@ -1514,11 +1598,19 @@ class ResearchWorkflowNodes:
             raise
 
         content = getattr(response, "content", "")
+        content_text = content if isinstance(content, str) else str(content)
+        response_extra = getattr(response, "additional_kwargs", {})
+        reasoning_content = (
+            response_extra.get("reasoning_content", "")
+            if isinstance(response_extra, dict) else ""
+        )
         metric.update({
             "duration_ms": round((time.perf_counter() - started_at) * 1000),
-            "output_chars": len(content) if isinstance(content, str) else len(str(content)),
-            "status": "completed",
+            "output_chars": len(content_text),
+            "status": "completed" if content_text.strip() else "empty",
         })
+        if reasoning_content:
+            metric["reasoning_chars"] = len(str(reasoning_content))
         for metadata in (
             getattr(response, "usage_metadata", None),
             getattr(response, "response_metadata", None),
@@ -1541,6 +1633,10 @@ class ResearchWorkflowNodes:
                         metric[metric_name] = value
                         break
         self.log_detail(f"[LLM_METRIC] {json.dumps(metric, ensure_ascii=False)}")
+        if not content_text.strip():
+            raise EmptyModelResponseError(
+                "The model returned no final content. Disable thinking in LM Studio or increase its output budget."
+            )
         return response
     def report_progress(self, stage: str, status: str, detail: str = "") -> None:
         if self.progress is not None:
@@ -1606,7 +1702,7 @@ class ResearchWorkflowNodes:
             "source_decisions": [],
             "next_action": "Create a research plan.",
         }, ensure_ascii=False, separators=(",", ":"))
-        self.log_detail("入力整理: 元の質問をメモスナップショットへ記録し、LLM呼び出しを省略しました")
+        self.log_detail("入力整理: 元の質問をメモスナップショットにプログラムで自動記録しました")
         if self.board_update is not None:
             self.board_update(memo)
         return {"understood_request": understood, "run_memo": memo}
@@ -1638,7 +1734,7 @@ class ResearchWorkflowNodes:
 }}
 ```"""
         try:
-            response = self.invoke_llm("planner", prompt)
+            response = self.invoke_llm("planner", prompt, llm=self.planner_llm)
             data = parse_json_from_response(response.content)
             plan = SearchPlan.model_validate(data)
             if not plan.tasks:
@@ -1895,6 +1991,15 @@ class ResearchWorkflowNodes:
         unique_results = _evaluation_sources(
             all_results, official_candidates=state.get("official_results", []),
         )
+        cached_source_assessments: list[SourceAssessment] = []
+        assessment_targets: list[SearchResult] = []
+        for item in unique_results:
+            cached_assessment = self.source_assessment_cache.get(item.url, item.content)
+            if cached_assessment is None:
+                assessment_targets.append(item)
+            else:
+                cached_source_assessments.append(cached_assessment)
+        assessment_target_urls = {item.url for item in assessment_targets if item.url}
         official_urls = {item.url for item in state.get("official_results", []) if item.url}
         evaluation_urls = {item.url for item in unique_results if item.url}
         for item in all_results:
@@ -1931,69 +2036,52 @@ class ResearchWorkflowNodes:
                 f"品質評価の入力上限と出典分散により {capped_count}件を今回の評価対象から外しました "
                 f"（評価対象上限: {MAX_EVIDENCE_SOURCES}件）"
             )
-        formatted_evidence = format_results_for_llm(unique_results)[:MAX_EVALUATION_EVIDENCE_CHARS]
+        formatted_evidence = format_results_for_llm(unique_results)
         if not formatted_evidence:
             formatted_evidence = "No eligible evidence."
-        official_evidence = format_results_for_llm(_evaluation_sources(
-            state.get("official_results", []), official_candidates=state.get("official_results", []),
-        ))[:MAX_OFFICIAL_EVALUATION_EVIDENCE_CHARS]
-        if not official_evidence:
-            official_evidence = "No official candidates."
         brief_context = research_brief_context(state.get("run_memo", ""), evaluation_urls)
-        prompt = f"""Research brief (source-linked facts and open questions only; verify against evidence): {brief_context or "none"}
-あなたはリサーチ品質評価担当です。現在日: {self.current_date}
-質問: {state['query']}
-調査計画: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
-前回までの研究ブリーフ（選定済みURLに紐付く要点のみ。根拠本文と矛盾すれば本文を優先）:
-上記の Research brief を参照
-関連度スコア {MIN_RELEVANCE_FOR_EVALUATION:.2f} 以上の検索結果およびWebページ本文（これ以外の検索結果は評価から除外済み）:
+        assessment_targets_text = "\n".join(
+            f"- {item.url} | {item.title[:120]} | fetch={item.fetch_status or 'unknown'}"
+            for item in assessment_targets
+        ) or "none"
+        cached_assessments_text = "\n".join(
+            f"- {assessment.url} | credibility={assessment.credibility:.2f} | use={assessment.use_as_evidence} | {assessment.reason[:140]}"
+            for assessment in cached_source_assessments
+        ) or "none"
+        source_assessment_instruction = f"""
+Page-level source assessment:
+- Assess every URL in `URLs requiring assessment` and no other URL.
+- Judge this fetched page, not the reputation of its domain. Consider publisher/author attribution, editorial accountability, traceable primary evidence, independence, recency, and relevance to the user's question.
+- Set `use_as_evidence` to true only if the page directly supports a bounded claim in the final answer. Reject pages that are off-topic, lack a usable body, are unattributed reposts/aggregations, or make material claims without traceable support.
+- A registered official or trusted domain is a ranking signal, not automatic evidence acceptance.
+- Return concise reasons and a short `support_scope`; do not invent facts.
+URLs requiring assessment:
+{assessment_targets_text}
+Previously cached page assessments (reuse unless the current evidence contradicts them):
+{cached_assessments_text}
+"""
+        prompt = f"""You are a web-research quality evaluator (リサーチ品質評価担当). Return exactly one valid JSON object, with no prose or reasoning tags.
+Date: {self.current_date}
+Question: {state['query']}
+Plan: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
+Evidence (each item has a URL and retrieved page text when available):
 {formatted_evidence}
-
-公式ソース専用レーンで取得した候補:
-{official_evidence}
-
-評価範囲: 元の質問に答えるのに必要な情報だけを不足扱いしてください。広い「新キャラを調べて」のような依頼では、名前・公式発表かリークか・実装状況や日程の確認を中心にし、性能、育成、ガチャ確率、星声計算など依頼されていない詳細は必須条件にしないでください。
-
-追加検索案は質問・調査計画と上記の関連性が確認された情報源だけから作成してください。上記に含まれない情報源の内容や話題は推測・補完しないでください。関連度を満たす情報源がない場合は、質問と調査計画に直接沿った一般的な確認クエリだけを提案してください。
-
-additional_queries は通常のWeb検索レーン向け、official_additional_queries は公式サイト・発表元・一次資料を探す公式レーン向けです。公式情報を探す案を通常レーンに混ぜず、二次情報や独立報道を探す案を公式レーンに混ぜないでください。どちらも検索エンジン向けの短いキーワード列とし、各クエリは1つの不足項目に絞り、説明文・理由・番号・検索演算子は付けません。既に検索済みの語句を繰り返さないでください。
-
-## 評価指針
-各検索結果には「ソース区分」（primary / secondary / other）、「信頼度」（0-1）、「新鮮度」（0-1）が付与されています。
-一次情報を優先しますが、二次情報であることだけを理由に証拠を弱いと判定してはいけません。次の基準で主張ごとに厳密に評価してください:
-source区分が other、または信頼度が中立値であることだけで本文を捨てないでください。明らかなスパム、対象と無関係なページ、本文のないページを除き、取得できた複数の本文を照合し、確度に応じて根拠の強さを判断してください。
-1. **まず公式文書、研究論文、規制・標準機関などの一次情報を探し、重要な事実・数値を照合する。**
-2. **一次情報が見つからない、存在しない、アクセスできない、または当該主張を扱っていない場合は、その事情を区別する。検索結果がないだけで「一次情報が存在しない」と断定しない。**
-   公式ソース専用レーンに候補がある場合は、発行元・本文・日付を実際に照合してから「公式情報がない」と判断する。本文取得に失敗した場合は「存在しない」ではなく「確認できなかった」とする。
-3. **一次情報を確認できない場合、編集責任のある専門媒体・業界紙・調査機関など、独自取材や方法を示す高品質な二次情報を優先する。**
-4. **高品質な二次情報を使う場合、同じ主張を裏付ける独立した情報源が複数あるかを確認する。目安は異なる発行元ドメインの2件以上。転載、プレスリリースの再掲、同一通信社記事の配信先違いは独立した裏付けとして数えない。独立性を確認できない場合はその不確かさを明記する。**
-5. **各主張についてソース間の一致・矛盾を確認する。重要な数値・仕様（性能、容量、価格など）は、可能な限り一次情報または複数の独立した根拠で照合する。**
-6. **「other」や信頼性を判断できないソース1件だけに依拠する主張は weak_evidence とする。高品質で独立した複数の二次情報が一致していれば、二次情報のみでも十分と判定してよい。**
-7. **新鮮度スコアが低い情報や、ページ間の矛盾・未確認事項を指摘する。**
-8. **追加検索が有効な不足だけをレーン別に提案する。公式の所在・発表・一次資料の確認は official_additional_queries、独立した専門二次情報の裏付けは additional_queries に入れる。両方が必要なら両方に提案する。**
-9. 共有ボードは既存投稿と根拠を確認する索引として参照してください。新規投稿の判断と書き込みは後続の専用ノードが行います。
-10. sufficiency は元の質問に対する回答可能性で判定する。質問されていない性能・育成・ガチャ詳細が未確認でも、それだけを理由に不足とはしない。
-
-検索クエリとURLを見て、ソースが独立しているか慎重に判断してください。異なるURLだけでは独立した根拠とは言えません。一次情報がなくても、独立した高品質な二次情報が十分に裏付けるなら sufficient を true にできます。その場合、reason に一次情報を確認できなかった事情と二次情報を採用した理由を簡潔に記してください。
-
-Webページ本文やスニペットを確認し、内部の思考過程は出力せず、以下のJSON形式のみを出力してください。<think>タグ、分析文、JSON以外の前置きは出力禁止です。reason は簡潔な1文にしてください。
-
-```json
-{{
-  "sufficient": false,
-  "missing_information": ["不足している情報1"],
-  "weak_evidence": ["根拠が弱い点1（独立確認のない情報源、矛盾など）"],
-  "reason": "評価理由",
-  "additional_queries": ["対象名 不足項目 専門媒体"],
-  "official_additional_queries": ["対象名 不足項目 公式発表"],
-}}
-```
-
-※ 十分な情報が揃っている場合は sufficient を true、missing_information / weak_evidence / additional_queries / official_additional_queries を空配列 [] にしてください。独立した高品質な二次情報で十分に裏付けられる場合も十分と判定できます。"""
+{source_assessment_instruction}
+Rules:
+- Decide whether the evidence answers the question without unsupported claims.
+- Prefer direct primary evidence for material facts. Secondary evidence must be relevant and independently traceable; a domain label alone is never enough. 二次情報であることだけを理由に証拠を弱いと判定してはいけません。
+- For material secondary claims, seek independent support from at least two different publisher domains; syndicated or reposted copies do not count. 異なる発行元ドメインの2件以上を目安にし、転載・再掲は独立根拠として数えません。
+- Mark missing, stale, contradictory, inaccessible, or unsupported material as insufficient. Do not claim that a source exists or is absent unless the evidence shows it.
+- Add short search-engine queries only for information that would materially improve the answer. Put first-party or official-document searches in `official_additional_queries`.
+Return this JSON schema (keep strings concise):
+{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"","additional_queries":[],"official_additional_queries":[],"source_assessments":[{{"url":"","credibility":0.0,"use_as_evidence":false,"reason":"","support_scope":""}}]}}
+"""
         raw_evaluation = ""
         evaluation_failed = False
         try:
-            response = self.invoke_llm("evaluate", prompt, source_count=len(unique_results))
+            response = self.invoke_llm(
+                "evaluate", prompt, llm=self.evaluator_llm, source_count=len(unique_results),
+            )
             raw_evaluation = response.content
             data = normalize_evaluation_payload(parse_json_from_response(raw_evaluation))
             eval_obj = Evaluation.model_validate(data)
@@ -2013,7 +2101,9 @@ Webページ本文やスニペットを確認し、内部の思考過程は出�
 
 JSON例:
 {{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"official_additional_queries":[]}}'''
-                repaired = self.invoke_llm("evaluate_repair", repair_prompt, source_count=len(unique_results))
+                repaired = self.invoke_llm(
+                    "evaluate_repair", repair_prompt, llm=self.evaluator_llm, source_count=len(unique_results),
+                )
                 repaired_data = normalize_evaluation_payload(parse_json_from_response(repaired.content))
                 eval_obj = Evaluation.model_validate(repaired_data)
                 self.log_detail("品質評価の再試行に成功しました")
@@ -2041,6 +2131,38 @@ JSON例:
                     additional_queries=fallback_queries,
                     official_additional_queries=[],
                 )
+
+        fresh_source_assessments = [
+            assessment for assessment in eval_obj.source_assessments
+            if assessment.url in assessment_target_urls
+        ]
+        eval_obj.source_assessments = merge_assessments(
+            cached_source_assessments,
+            fresh_source_assessments,
+            allowed_urls=(item.url for item in unique_results),
+        )
+        result_by_url = {item.url: item for item in unique_results if item.url}
+        for assessment in fresh_source_assessments:
+            result = result_by_url.get(assessment.url)
+            if result is not None:
+                self.source_assessment_cache.put(assessment, result.content)
+
+        for assessment in eval_obj.source_assessments:
+            result = result_by_url.get(assessment.url)
+            if result is None:
+                continue
+            accepted = (
+                assessment.use_as_evidence
+                and assessment.credibility >= self.settings.source_assessment_min_credibility
+            )
+            self.log_source_trace(
+                "page_assessment",
+                result,
+                "accepted" if accepted else "rejected",
+                assessment.reason,
+                official_candidate=result.url in official_urls,
+                page_assessment=assessment,
+            )
 
         proposed_queries = eval_obj.additional_queries
         proposed_official_queries = eval_obj.official_additional_queries
@@ -2100,6 +2222,15 @@ JSON例:
             self.log_detail(f"  通常レーン追加案: {query}")
         for query in eval_obj.official_additional_queries:
             self.log_detail(f"  公式レーン追加案: {query}")
+        for assessment in eval_obj.source_assessments:
+            decision = "accepted" if (
+                assessment.use_as_evidence
+                and assessment.credibility >= self.settings.source_assessment_min_credibility
+            ) else "rejected"
+            self.log_detail(
+                f"Source assessment: {decision} | credibility={assessment.credibility:.2f} | "
+                f"{assessment.url} | {assessment.reason}"
+            )
         return {"evaluation": eval_obj}
 
     def update_board(self, state: State):
@@ -2111,16 +2242,36 @@ JSON例:
         board_sources = _evaluation_sources(
             all_results, official_candidates=state.get("official_results", []),
         )
-        source_items = [
-            {
+        assessment_map = assessment_by_url(evaluation.source_assessments if evaluation else [])
+        source_items = []
+        for item in board_sources[:3]:
+            assessment = assessment_map.get(item.url)
+            if assessment is None:
+                decision = "unassessed"
+                reason = "No completed page-level assessment; retained as a candidate only."
+                if item.fetch_error:
+                    reason = f"{reason} Fetch: {item.fetch_error}"
+                credibility = None
+            elif (
+                assessment.use_as_evidence
+                and assessment.credibility >= self.settings.source_assessment_min_credibility
+            ):
+                decision = "accepted_as_evidence"
+                reason = assessment.reason
+                credibility = assessment.credibility
+            else:
+                decision = "rejected_as_evidence"
+                reason = assessment.reason
+                credibility = assessment.credibility
+            source_items.append({
                 "url": item.url[:220],
                 "title": item.title[:120],
                 "fetch_status": item.fetch_status,
-                "decision": "selected_for_evaluation",
-                "reason": "Candidate passed the current evidence selection.",
-            }
-            for item in board_sources[:3]
-        ]
+            "fetch_error": item.fetch_error,
+                "decision": decision,
+                "reason": reason[:180],
+                "credibility": credibility,
+            })
         known_source_urls = {item["url"] for item in source_items}
         evaluation_summary = {
             "sufficient": evaluation.sufficient if evaluation else False,
@@ -2353,20 +2504,54 @@ Return exactly this JSON schema:
             (state.get("evidence_results", []) or state.get("results", []))
             + state.get("official_results", [])
         )
+        evaluation = state.get("evaluation")
+        assessment_map = assessment_by_url(evaluation.source_assessments if evaluation else [])
+        eligible_candidates = []
+        for item in candidate_results:
+            assessment = assessment_map.get(item.url)
+            if assessment is None or (
+                assessment.use_as_evidence
+                and assessment.credibility >= self.settings.source_assessment_min_credibility
+            ):
+                eligible_candidates.append(item)
         unique_results = _evaluation_sources(
-            candidate_results, official_candidates=state.get("official_results", []),
+            eligible_candidates, official_candidates=state.get("official_results", []),
         )
-        self.log_detail(f"レポート作成: 関連度と出典分散で選んだ根拠ソース {len(unique_results)}件を使用")
+        self.log_detail(
+            f"Final evidence: {len(unique_results)} source(s) after relevance, diversity, and page assessment."
+        )
         official_urls = {item.url for item in state.get("official_results", []) if item.url}
         final_urls = {item.url for item in unique_results if item.url}
         for item in candidate_results:
+            assessment = assessment_map.get(item.url)
+            if assessment is not None and not (
+                assessment.use_as_evidence
+                and assessment.credibility >= self.settings.source_assessment_min_credibility
+            ):
+                decision = "rejected"
+                reason = f"Rejected by page assessment: {assessment.reason}"
+            elif item.url in final_urls:
+                decision = "included"
+                reason = "Included in final-answer evidence."
+            else:
+                decision = "excluded"
+                reason = "Excluded by final evidence selection."
             self.log_source_trace(
-                "final_answer", item,
-                "included" if item.url in final_urls else "excluded",
-                "Included in final-answer evidence." if item.url in final_urls else "Excluded by final evidence selection.",
+                "final_answer", item, decision, reason,
                 official_candidate=item.url in official_urls,
+                page_assessment=assessment,
             )
-        formatted_evidence = format_results_for_llm(unique_results)[:MAX_EVALUATION_EVIDENCE_CHARS]
+        if not unique_results:
+            self.log_detail("Final answer skipped: no eligible evidence remained after assessment.")
+            return {
+                "summary": (
+                    "## \u8abf\u67fb\u7d50\u679c\n\n"
+                    "\u6700\u7d42\u56de\u7b54\u306e\u6839\u62e0\u3068\u3057\u3066\u63a1\u7528\u3067\u304d\u308b\u60c5\u5831\u6e90\u304c\u6b8b\u3089\u306a\u304b\u3063\u305f\u305f\u3081\u3001"
+                    "\u6839\u62e0\u306e\u306a\u3044\u56de\u7b54\u306f\u751f\u6210\u3057\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u691c\u7d22\u6761\u4ef6\u3084\u767b\u9332\u30c9\u30e1\u30a4\u30f3\u3092\u898b\u76f4\u3057\u3001"
+                    "\u518d\u8abf\u67fb\u3057\u3066\u304f\u3060\u3055\u3044\u3002"
+                )
+            }
+        formatted_evidence = format_results_for_llm(unique_results)
         evaluation = state.get("evaluation")
         quality_note = ""
         if evaluation is not None and not evaluation.sufficient:
@@ -2397,7 +2582,16 @@ Return exactly this JSON schema:
 5. 取得情報から確認できないことは断定せず、調査品質が不十分な場合はその制約を明記してください。
 6. 元の質問で求められていない性能・育成・ガチャ詳細を必須情報のように付け加えず、公式確定情報とリーク・予想を明確に分けてください。
 7. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
-        answer = strip_model_reasoning(self.invoke_llm("final_answer", answer_prompt, source_count=len(unique_results)).content)
+        try:
+            answer = strip_model_reasoning(self.invoke_llm(
+                "final_answer", answer_prompt, llm=self.answer_llm, source_count=len(unique_results),
+            ).content)
+        except EmptyModelResponseError as error:
+            self.log_detail(f"Final answer generation produced no content: {error}")
+            return {"summary": (
+                "調査結果を生成できませんでした。LM Studioでこのモデルの思考モードを無効化するか、"
+                "役割別の出力上限を増やしてから再実行してください。"
+            )}
         issues = citation_issues(answer, len(unique_results))
         has_citations = bool(_SOURCE_REF_RE.search(answer))
         if unique_results and (issues or not has_citations):
@@ -2420,7 +2614,13 @@ Return exactly this JSON schema:
 思考過程や自己対話は出力せず、修正後の回答本文だけを出力してください。<think>等のタグも含めないでください。
 調査品質が不十分な場合の注意:
 {quality_note or "特段の不足は検出されていません。"}"""
-            answer = strip_model_reasoning(self.invoke_llm("final_answer_citation_retry", retry_prompt, source_count=len(unique_results)).content)
+            try:
+                answer = strip_model_reasoning(self.invoke_llm(
+                    "final_answer_citation_retry", retry_prompt,
+                    llm=self.answer_llm, source_count=len(unique_results),
+                ).content)
+            except EmptyModelResponseError as error:
+                self.log_detail(f"Citation retry produced no content; keeping the first answer: {error}")
         else:
             self.log_detail("出典検証: 出典番号の形式と範囲を確認しました（主張の裏付けは未検証）")
 

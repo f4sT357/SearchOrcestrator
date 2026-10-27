@@ -6,3 +6,4 @@ __pycache__/
 firecrawl-selfhost/
 *.lnk
 config.local.json
+.cache/

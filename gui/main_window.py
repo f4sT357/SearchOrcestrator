@@ -51,6 +51,7 @@ from gui.workflow_view import WorkflowProgressView
 from PySide6.QtCore import QThreadPool
 from gui.worker import (
     ModelFetchRunnable,
+    ModelLoadRunnable,
     RerankerPreloadSignals,
     ResearchWorker,
     preload_reranker_background,
@@ -67,6 +68,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker: ResearchWorker | None = None
         self.model_fetch_worker: ModelFetchWorker | None = None
+        self.model_load_runnable: ModelLoadRunnable | None = None
         self.last_results: list[SearchResult] = []
         self.default_settings = Settings.from_environment()
         self.config_path = os.path.join(parent_dir, "config.local.json")
@@ -186,6 +188,25 @@ class MainWindow(QMainWindow):
         self.api_key_edit.setToolTip("AIへの接続に必要な合言葉です。PC内のLM Studioで認証を設定していなければ、初期値のままで使えます。")
         settings_layout.addRow("APIキー:", self.api_key_edit)
 
+        self.lmstudio_context_spin = QSpinBox(self)
+        self.lmstudio_context_spin.setRange(1024, 262144)
+        self.lmstudio_context_spin.setSingleStep(4096)
+        self.lmstudio_context_spin.setValue(self.default_settings.lmstudio_context_length)
+        self.lmstudio_context_spin.setToolTip(
+            "LM Studioで選択モデルを読み込むときのコンテキスト上限です。入力と出力の合計に使います。"
+        )
+        self.lmstudio_auto_load_cb = QCheckBox("開始前にLM Studioへモデルを読み込む", self)
+        self.lmstudio_auto_load_cb.setChecked(self.default_settings.lmstudio_auto_load_model)
+        self.lmstudio_auto_load_cb.setToolTip(
+            "選択したモデルだけを、ここで指定したコンテキスト長で確認・必要時に再読み込みしてから調査します。"
+            "ほかのロード済みモデルは変更しません。"
+        )
+        lmstudio_row = QHBoxLayout()
+        lmstudio_row.addWidget(QLabel("コンテキスト長:"))
+        lmstudio_row.addWidget(self.lmstudio_context_spin)
+        lmstudio_row.addStretch()
+        settings_layout.addRow("LM Studioロード設定:", lmstudio_row)
+        settings_layout.addRow("モデル管理:", self.lmstudio_auto_load_cb)
         self.official_domains_edit = QLineEdit(
             ", ".join(self.default_settings.official_domains), self,
         )
@@ -553,6 +574,8 @@ class MainWindow(QMainWindow):
     def _save_config(self) -> None:
         data = {
             "model": self.model_combo.currentText().strip(),
+            "lmstudio_context_length": self.lmstudio_context_spin.value(),
+            "lmstudio_auto_load_model": self.lmstudio_auto_load_cb.isChecked(),
             "base_url": self.base_url_edit.text().strip(),
             "max_concurrency": self.concurrency_spin.value(),
             "max_search_queries": self.max_queries_spin.value(),
@@ -573,7 +596,7 @@ class MainWindow(QMainWindow):
         }
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, "r", encoding="utf-8") as f:
+                with open(self.config_path, "r", encoding="utf-8-sig") as f:
                     existing = json.load(f)
                 if not isinstance(existing, dict):
                     raise ValueError("設定ファイルのトップレベルはJSONオブジェクトにしてください")
@@ -622,6 +645,8 @@ class MainWindow(QMainWindow):
         max_concurrency = self.concurrency_spin.value()
         settings = replace(self.default_settings,
             model=model,
+            lmstudio_context_length=self.lmstudio_context_spin.value(),
+            lmstudio_auto_load_model=self.lmstudio_auto_load_cb.isChecked(),
             base_url=self.base_url_edit.text().strip() or self.default_settings.base_url,
             api_key=self.api_key_edit.text().strip() or self.default_settings.api_key,
             max_concurrency=max_concurrency,
@@ -646,22 +671,64 @@ class MainWindow(QMainWindow):
             trusted_domains=trusted_domains,
         )
 
-        # UI state during run
+        if settings.lmstudio_auto_load_model:
+            self._load_lmstudio_then_start(query, settings)
+        else:
+            self._start_research_worker(query, settings)
+    def _load_lmstudio_then_start(self, query: str, settings: Settings) -> None:
         self.start_btn.setEnabled(False)
-        self.start_btn.setText("⏳ 調査中...")
-        self.status_label.setText("調査を実行しています...")
-        self.progress_bar.setRange(0, 0)  # Marquee/busy mode
+        self.start_btn.setText("モデル読込中...")
+        self.status_label.setText("LM Studioでモデルを読み込み、設定を確認しています...")
+        self.progress_bar.setRange(0, 0)
+        self._log(
+            f"LM Studioモデルを準備中: {settings.model} / コンテキスト長 {settings.lmstudio_context_length}"
+        )
+        runnable = ModelLoadRunnable(settings)
+        self.model_load_runnable = runnable
+        runnable.signals.loaded.connect(
+            lambda _model_key, instance_id, context_length, reused: self._on_lmstudio_model_loaded(
+                query, settings, instance_id, context_length, reused,
+            )
+        )
+        runnable.signals.load_failed.connect(self._on_lmstudio_model_load_failed)
+        QThreadPool.globalInstance().start(runnable)
+
+    def _on_lmstudio_model_loaded(
+        self,
+        query: str,
+        settings: Settings,
+        instance_id: str,
+        context_length: int,
+        reused_existing: bool,
+    ) -> None:
+        action = "既存インスタンスを再利用" if reused_existing else "モデルを読み込み"
+        self._log(f"LM Studio: {action}しました（{instance_id} / {context_length} tokens）")
+        self._start_research_worker(query, replace(settings, model=instance_id))
+
+    def _on_lmstudio_model_load_failed(self, error: str) -> None:
+        self.model_load_runnable = None
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("調査を開始する")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("LM Studioモデルを準備できませんでした")
+        self._log(f"LM Studioモデルの準備に失敗しました: {error}")
+        QMessageBox.critical(self, "LM Studioモデルエラー", error)
+
+    def _start_research_worker(self, query: str, settings: Settings) -> None:
+        self.model_load_runnable = None
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText("調査中...")
+        self.status_label.setText("調査を初期化しています...")
+        self.progress_bar.setRange(0, 0)
         self.board_edit.clear()
         self.workflow_view.begin_run()
-        self.tabs.setCurrentIndex(2)  # Keep the live workflow visible during execution
-
-        self._log(f"調査を開始します: 「{query}」")
-
-        # Launch Worker Thread
+        self.tabs.setCurrentIndex(2)
+        self._log(f"調査を開始します: {query}")
         self.worker = ResearchWorker(
             query=query,
             settings=settings,
-            max_concurrency=max_concurrency,
+            max_concurrency=self.concurrency_spin.value(),
             parent=self,
         )
         self.worker.log_signal.connect(self._log)
@@ -671,7 +738,6 @@ class MainWindow(QMainWindow):
         self.worker.error_signal.connect(self._on_error_received)
         self.worker.finished_signal.connect(self._on_worker_finished)
         self.worker.start()
-
     def _on_result_received(self, result: dict[str, Any]) -> None:
         summary = result.get("summary", "")
         results = result.get("results", [])
