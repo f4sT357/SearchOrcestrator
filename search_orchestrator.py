@@ -4,24 +4,36 @@ from __future__ import annotations
 
 import json
 import math
-import operator
 import re
 import time
 from functools import lru_cache
 from threading import Lock
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Callable, Protocol, TypedDict
-from urllib.parse import urlparse
+from typing import Any, Callable, Protocol
 
 import httpx
 from ddgs import DDGS
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from pydantic import BaseModel, Field
 
 from app_settings import Settings
+from evaluation_helpers import (
+    MAX_EVIDENCE_SOURCES,
+    MIN_RELEVANCE_FOR_EVALUATION,
+    _compact_query_terms,
+    _evaluation_sources,
+    _keyword_followup_query,
+    _validate_followup_queries,
+    deduplicate_results,
+    format_results_for_llm,
+    normalize_evaluation_payload,
+    parse_json_from_response,
+    research_brief_context,
+    select_diverse_results,
+)
+from research_models import BoardContext, Evaluation, SearchPlan, SearchResult, SearchTask, State
 from web_fetchers import (
     DefaultWebContentFetcher,
     FetchError,
@@ -84,88 +96,6 @@ def fetch_available_models(base_url: str, api_key: str = "", timeout: float = 3.
 
 
 # ---------------------------------------------------------------------------
-# Domain models
-# ---------------------------------------------------------------------------
-
-class SearchTask(BaseModel):
-    aspect: str = Field(description="調査する観点")
-    query: str = Field(description="実際に検索する検索クエリ")
-    reason: str = Field(description="検索する理由")
-
-
-class SearchPlan(BaseModel):
-    tasks: list[SearchTask]
-    official_queries: list[str] = Field(default_factory=list)
-
-
-class Evaluation(BaseModel):
-    sufficient: bool
-    missing_information: list[str]
-    weak_evidence: list[str]
-    reason: str
-    additional_queries: list[str]
-    official_additional_queries: list[str] = Field(default_factory=list)
-    source_assessments: list[SourceAssessment] = Field(default_factory=list)
-
-
-
-class SearchResult(BaseModel):
-    query: str
-    title: str
-    url: str
-    snippet: str
-    content: str | None = None
-    relevance_score: float | None = None
-    fetch_status: str | None = None
-    fetch_error: str | None = None
-    # Source quality metadata (populated by rerank_results)
-    source_reliability: str | None = None   # "primary" | "secondary" | "other"
-    source_trust_score: float | None = None  # 0-1 domain trust
-    source_freshness_score: float | None = None  # 0-1 freshness estimate
-    combined_score: float | None = None      # final ranking score
-    page_date: str | None = None
-
-    def to_evidence_text(self) -> str:
-        score_parts = []
-        if self.relevance_score is not None:
-            score_parts.append(f"関連度スコア: {self.relevance_score:.3f}")
-        if self.source_reliability is not None:
-            score_parts.append(f"ソース区分: {self.source_reliability}")
-        if self.source_trust_score is not None:
-            score_parts.append(f"信頼度: {self.source_trust_score:.2f}")
-        if self.source_freshness_score is not None:
-            score_parts.append(f"新鮮度: {self.source_freshness_score:.2f}")
-        if self.page_date:
-            score_parts.append(f"ページ日付: {self.page_date}")
-        score_info = f" [{', '.join(score_parts)}]" if score_parts else ""
-        text = f"【タイトル】: {self.title}{score_info}\n【URL】: {self.url}\n【概要/スニペット】: {self.snippet}"
-        if self.content:
-            text += f"\n【Webページ本文抜粋】:\n{self.content}"
-        return text
-
-
-
-class State(TypedDict):
-    query: str
-    understood_request: str
-    plan: SearchPlan | None
-    task: SearchTask | None
-    results: Annotated[list[SearchResult], operator.add]
-    evidence_results: Annotated[list[SearchResult], operator.add]
-    official_results: Annotated[list[SearchResult], operator.add]
-    evaluation: Evaluation | None
-    run_memo: str
-    summary: str
-    search_query_count: Annotated[int, operator.add]
-    search_round: Annotated[int, operator.add]
-    searched_queries: Annotated[list[str], operator.add]
-    normal_search_query_count: Annotated[int, operator.add]
-    official_search_query_count: Annotated[int, operator.add]
-    pending_normal_queries: list[str]
-    pending_official_queries: list[str]
-
-
-# ---------------------------------------------------------------------------
 # Protocols
 # ---------------------------------------------------------------------------
 
@@ -218,151 +148,6 @@ def _load_reranker(model_name: str) -> Reranker:
         return _load_reranker_cached(model_name)
 
 
-# Sources below this calibrated relevance score cannot steer quality evaluation
-# or the follow-up search queries it generates.
-MIN_RELEVANCE_FOR_EVALUATION = 0.20
-MIN_RELEVANCE_FOR_FOLLOWUP_QUERY = 0.60
-MAX_EVIDENCE_SOURCES = 6
-MAX_EVIDENCE_CHARS = 9000
-_PLACEHOLDER_QUERY_RE = re.compile(
-    r"(?:リサーチプランナー|詳細調査クエリ\s*\d+|検索クエリ\s*\d+|search query\s*#?\d+)",
-    re.IGNORECASE,
-)
-_QUERY_STOP_TERMS = {
-    "について", "キャラクター", "キャラ", "調査", "比較", "情報", "教えて", "ください",
-    "ゲーム", "公式", "一次資料", "能力", "詳細", "性能", "評価", "最新", "確認",
-}
-
-
-def _evaluation_sources(
-    results: list[SearchResult],
-    *,
-    official_candidates: list[SearchResult] | None = None,
-) -> list[SearchResult]:
-    relevant = [
-        item for item in deduplicate_results(results)
-        if item.relevance_score is not None
-        and item.relevance_score >= MIN_RELEVANCE_FOR_EVALUATION
-    ]
-    ranked = sorted(relevant, key=lambda item: item.combined_score or 0.0, reverse=True)
-    # Keep room for relevant primary evidence and results from the dedicated
-    # official-search lane so a large pile of secondary results cannot crowd
-    # every official candidate out of the evaluator context.
-    official_urls = {
-        item.url for item in (official_candidates or [])
-        if item.url and item.relevance_score is not None and item.relevance_score >= 0.45
-    }
-    primary = [
-        item for item in ranked
-        if item.source_reliability == "primary" or item.url in official_urls
-    ]
-    primary_slots = min(3, MAX_EVIDENCE_SOURCES)
-    selected_primary = select_diverse_results(primary, primary_slots)
-    selected_urls = {item.url for item in selected_primary}
-    remaining = [item for item in ranked if item.url not in selected_urls]
-    selected_secondary = select_diverse_results(
-        remaining, max(0, MAX_EVIDENCE_SOURCES - len(selected_primary)),
-    )
-    return selected_primary + selected_secondary
-
-
-def _query_anchor_terms(query: str) -> set[str]:
-    terms = re.findall(r"[A-Za-z][A-Za-z0-9-]*|[\u30A0-\u30FFー]{2,}|[\u3400-\u9FFF々]{2,}", query)
-    return {
-        term.casefold() for term in terms
-        if term.casefold() not in _QUERY_STOP_TERMS and len(term) > 1
-    }
-
-
-def _compact_query_terms(text: str) -> str:
-    """Turn a question or missing-information note into concise search terms."""
-    candidate = re.sub(r"<think>.*?</think>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    candidate = re.sub(r"\[[^\]]*\]", " ", candidate)
-    request_match = re.search(
-        r"(?:について|に関して|に関する|を|が|は)?(?:調査|調べ|検索|教えて|説明|解説|まとめ|知りたい|確認)",
-        candidate,
-    )
-    if request_match:
-        candidate = candidate[:request_match.start()]
-    candidate = re.sub(r"という|として|について|に関して|に関する", " ", candidate)
-    candidate = re.sub(r"(?<=[\u3400-\u9fff])の(?=[\u3040-\u30ff\u3400-\u9fff「『\"'])", " ", candidate)
-    candidate = re.sub(r"(?:の|を|が|は|と|に|で|へ|も|や)\s*$", " ", candidate)
-    candidate = re.sub(r"[、。,.!?！？:：;；/／()（）「」『』\"'`]+", " ", candidate)
-    candidate = re.sub(r"\s+", " ", candidate).strip()
-    return candidate
-
-
-def _keyword_followup_query(
-    original_query: str,
-    missing_information: list[str],
-    searched_queries: list[str],
-) -> str | None:
-    """Build a short, non-repeating fallback from the topic and one missing facet."""
-    subject = _compact_query_terms(original_query)
-    if not subject:
-        subject = original_query.strip()
-
-    facets = [_compact_query_terms(item) for item in missing_information]
-    facets = [facet for facet in facets if facet]
-    is_character_topic = any(
-        kw in original_query.casefold()
-        for kw in ("キャラ", "character", "登場人物", "主人公", "キャスト", "声優")
-    )
-    if is_character_topic:
-        facets.extend(("公式 キャラクター紹介", "公式 キャラクタープロフィール", "公式 告知"))
-    else:
-        facets.extend(("公式 発表", "公式 お知らせ", "公式サイト 最新情報", "公式 更新履歴", "公式 文書"))
-    seen = {re.sub(r"\s+", " ", query).strip().casefold() for query in searched_queries}
-    for facet in facets:
-        query = re.sub(r"\s+", " ", f"{subject} {facet}").strip()
-        if query.casefold() not in seen:
-            return query
-    return None
-
-
-def _validate_followup_queries(
-    original_query: str,
-    proposed_queries: list[str],
-    reranker: Reranker,
-) -> list[str]:
-    """Reject model-generated follow-ups that drift away from the user topic."""
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for proposed in proposed_queries:
-        candidate = re.sub(r"\[\s*S?\d+\s*\]", " ", proposed, flags=re.IGNORECASE)
-        candidate = candidate.strip().strip("[] \t\r\n:：-•")
-        candidate = re.sub(r"^\d+[.)、:]\s*", "", candidate).strip()
-        candidate = re.sub(r"\s+", " ", candidate)
-        normalized = candidate.casefold()
-        if (
-            not candidate
-            or len(candidate) > 300
-            or normalized in seen
-            or _PLACEHOLDER_QUERY_RE.search(candidate)
-        ):
-            continue
-        seen.add(normalized)
-        cleaned.append(candidate)
-
-    if not cleaned:
-        return []
-
-    scores = reranker.predict(
-        [(original_query, candidate) for candidate in cleaned],
-        batch_size=32,
-    )
-    anchors = _query_anchor_terms(original_query)
-    accepted = []
-    for candidate, raw_score in zip(cleaned, scores, strict=True):
-        score = float(raw_score)
-        candidate_folded = candidate.casefold()
-        contains_anchor = any(term in candidate_folded for term in anchors)
-        if score < MIN_RELEVANCE_FOR_FOLLOWUP_QUERY or (
-            anchors and not contains_anchor and score < 0.75
-        ):
-            continue
-        accepted.append(candidate)
-    return accepted
 
 
 # ---------------------------------------------------------------------------
@@ -386,14 +171,6 @@ def add_search_results(results: list[SearchResult], response, query: str) -> int
     return added_count
 
 
-def deduplicate_results(results: list[SearchResult]) -> list[SearchResult]:
-    seen: set[str] = set()
-    unique: list[SearchResult] = []
-    for item in results:
-        if item.url and item.url not in seen:
-            seen.add(item.url)
-            unique.append(item)
-    return unique
 
 
 def rerank_results(
@@ -434,20 +211,6 @@ def rerank_results(
     return sorted(enriched, key=lambda r: r.combined_score or 0.0, reverse=True)[:top_k]
 
 
-def select_diverse_results(results: list[SearchResult], top_k: int) -> list[SearchResult]:
-    """Prefer distinct publisher hosts in the final shortlist, then fill by rank."""
-    ranked = sorted(results, key=lambda r: r.combined_score or 0.0, reverse=True)
-    diverse: list[SearchResult] = []
-    remaining: list[SearchResult] = []
-    seen_hosts: set[str] = set()
-    for item in ranked:
-        host = (urlparse(item.url).hostname or "").lower().removeprefix("www.")
-        if host and host not in seen_hosts:
-            diverse.append(item)
-            seen_hosts.add(host)
-        else:
-            remaining.append(item)
-    return (diverse + remaining)[:max(0, top_k)]
 
 
 
@@ -529,30 +292,6 @@ def populate_content(
     return rescored
 
 
-def format_results_for_llm(results: list[SearchResult]) -> str:
-    """Format multiple sources while keeping total evidence within a prompt budget."""
-    entries = []
-    fixed_chars = 0
-    for i, item in enumerate(results, start=1):
-        heading = f"--- 検索結果 #{i} / 出典番号 [S{i}] / 検索クエリ: {item.query} ---\n"
-        metadata = item.model_copy(update={"content": None}).to_evidence_text()
-        fixed = f"{heading}{metadata}"
-        entries.append((fixed, item.content or ""))
-        fixed_chars += len(fixed) + 2
-
-    remaining_body_chars = max(0, MAX_EVIDENCE_CHARS - fixed_chars)
-    parts = []
-    remaining_sources = len(entries)
-    for fixed, body in entries:
-        body_limit = remaining_body_chars // max(remaining_sources, 1)
-        excerpt = body[:body_limit]
-        if len(body) > len(excerpt):
-            excerpt += "\n（本文は全体の入力上限に合わせて省略）"
-        part = fixed + (f"\n【Webページ本文抜粋】:\n{excerpt}" if excerpt else "")
-        parts.append(part)
-        remaining_body_chars = max(0, remaining_body_chars - min(len(body), body_limit))
-        remaining_sources -= 1
-    return "\n\n".join(parts)
 
 
 _SOURCE_REF_RE = re.compile(r"\[S(\d+)\]")
@@ -617,58 +356,8 @@ def render_verified_sources(text: str, results: list[SearchResult]) -> str:
     return cleaned
 
 
-def parse_json_from_response(text: str) -> dict:
-    """Extract JSON dictionary from model response text robustly."""
-    text = text.strip()
-    # 1. Try markdown code block
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-    # 2. Try outermost JSON object
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-    # 3. Direct parse
-    return json.loads(text)
 
 
-def normalize_evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
-    """Normalize common local-LLM variants before validating the evaluation schema."""
-    normalized = dict(data)
-    def normalize_queries(key: str) -> None:
-        queries = normalized.get(key, [])
-        if isinstance(queries, list):
-            normalized_queries = []
-            for item in queries:
-                query = item if isinstance(item, str) else (
-                    item.get("query") or item.get("search_query") or item.get("text")
-                    if isinstance(item, dict) else None
-                )
-                if isinstance(query, str) and query.strip():
-                    normalized_queries.append(query.strip())
-            normalized[key] = normalized_queries
-        elif isinstance(queries, dict):
-            query = queries.get("query") or queries.get("search_query") or queries.get("text")
-            normalized[key] = [query.strip()] if isinstance(query, str) and query.strip() else []
-        else:
-            normalized[key] = []
-    normalize_queries("additional_queries")
-    normalize_queries("official_additional_queries")
-    assessments = normalized.get("source_assessments", [])
-    if isinstance(assessments, dict):
-        assessments = [assessments]
-    normalized["source_assessments"] = [
-        item for item in assessments if isinstance(item, dict)
-    ] if isinstance(assessments, list) else []
-    return normalized
 
 
 def append_run_memo_posts(
@@ -703,49 +392,6 @@ def append_run_memo_posts(
 
 
 
-def research_brief_context(raw_memo: str, known_urls: set[str], *, max_chars: int = 600) -> str:
-    """Return only source-linked facts and open questions from a compact research brief."""
-    try:
-        memo = json.loads(raw_memo)
-    except (TypeError, json.JSONDecodeError):
-        return ""
-    if not isinstance(memo, dict):
-        return ""
-
-    lines: list[str] = []
-    unresolved = memo.get("unresolved", [])
-    if isinstance(unresolved, list):
-        questions = [str(item).strip()[:140] for item in unresolved if str(item).strip()][:3]
-        if questions:
-            lines.append("Open questions: " + " | ".join(questions))
-
-    confirmed = memo.get("confirmed", [])
-    if isinstance(confirmed, list):
-        facts: list[str] = []
-        for item in confirmed:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("source_url", "")).strip()
-            note = str(item.get("note", "")).strip()[:140]
-            if url in known_urls and note:
-                facts.append(f"{note} ({url})")
-        if facts:
-            lines.append("Source-linked facts: " + " | ".join(facts[:3]))
-
-    decisions = memo.get("source_decisions", [])
-    if isinstance(decisions, list):
-        decision_lines: list[str] = []
-        for item in decisions:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url", "")).strip()
-            decision = str(item.get("decision", "")).strip()[:48]
-            if url in known_urls and decision:
-                decision_lines.append(f"{url}: {decision}")
-        if decision_lines:
-            lines.append("Source decisions: " + " | ".join(decision_lines[:3]))
-
-    return "\n".join(lines)[:max_chars]
 def strip_model_reasoning(text: str) -> str:
     """Remove visible reasoning sections before model text reaches user output."""
     if not isinstance(text, str):
@@ -898,7 +544,7 @@ class ResearchWorkflowNodes:
             ) == "secondary",
             "relevance_score": item.relevance_score,
             "fetch_status": item.fetch_status,
-            "fetch_error": item.fetch_error,
+                "fetch_error": item.fetch_error,
         }
         if page_assessment is not None:
             payload["page_assessment"] = {
@@ -1048,9 +694,9 @@ class ResearchWorkflowNodes:
             self.board_update(memo)
         return {"understood_request": understood, "run_memo": memo}
 
-    def planner(self, state: State):
+    def _build_planner_prompt(self, query: str) -> str:
         prompt = f"""あなたはリサーチプランナーです。現在日: {self.current_date}
-ユーザーの入力: {state['query']}
+ユーザーの入力: {query}
 入力内容の整理は依頼の意図を理解するための補助です。元の入力と食い違う場合は元の入力を優先し、整理に書かれていない要望を追加しないでください。重複しない体系的な調査計画を作成してください。各 query は検索エンジン向けの短いキーワード列にしてください。質問文や依頼文をそのまま含めず、「対象名 + 調べる観点 + 必要なら情報源」の形で、1クエリにつき1観点、3〜8語程度にします。質問が「鳴潮 カルロッタ」のようなキーワード列なら、その語を対象名としてそのまま保持して観点だけを補ってください。
 
 通常の調査計画とは別に、運営元・公式サイト・公式告知・公式文書を探すための official_queries を最大5件作ってください。検索語や検索先を少しずつ変え、公式発表・お知らせ・更新履歴・公式SNSや配信ページなど、質問に合う一次情報の入口を複数探します。検索語には「公式」「告知」「お知らせ」「公式サイト」などを含めます。対象が特定できない site: ドメインを推測して付けないでください。このレーンは一次情報を探す専用であり、見つかったページが本当に公式かは後で本文と発行元を確認します。
@@ -1074,12 +720,15 @@ class ResearchWorkflowNodes:
   "official_queries": ["対象名 公式 発表", "対象名 公式 お知らせ", "対象名 公式サイト 最新情報", "対象名 公式 更新履歴", "対象名 公式 配信"]
 }}
 ```"""
+        return prompt
+
+    def _request_search_plan(self, query: str, prompt: str) -> SearchPlan:
         try:
             response = self.invoke_llm("planner", prompt, llm=self.planner_llm)
             data = parse_json_from_response(response.content)
             plan = SearchPlan.model_validate(data)
             if not plan.tasks:
-                plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
+                plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=query, reason="基本情報収集")])
             self.log_detail(f"調査計画: {len(plan.tasks)}件の観点を作成")
             self.log_detail("生成された調査計画の内容:")
             for index, task in enumerate(plan.tasks, start=1):
@@ -1090,12 +739,14 @@ class ResearchWorkflowNodes:
                 self.log_detail(f"  公式検索案 {index}: {query}")
         except Exception as err:
             print(f"調査計画のパース失敗 (フォールバック適用): {err}")
-            plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=state["query"], reason="基本情報収集")])
+            plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=query, reason="基本情報収集")])
             self.log_detail(f"調査計画の解析に失敗したため、基本検索に切り替えました: {err}")
+        return plan
 
+    def _validate_search_plan(self, query: str, plan: SearchPlan) -> SearchPlan:
         try:
             validated_queries = _validate_followup_queries(
-                state["query"], [task.query for task in plan.tasks], self.reranker,
+                query, [task.query for task in plan.tasks], self.reranker,
             )
         except Exception as error:
             validated_queries = []
@@ -1117,12 +768,12 @@ class ResearchWorkflowNodes:
         official_queries = list(dict.fromkeys(official_queries))
         try:
             official_queries = _validate_followup_queries(
-                state["query"], official_queries, self.reranker,
+                query, official_queries, self.reranker,
             )
         except Exception as error:
             self.log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {error}")
             official_queries = []
-        subject = _compact_query_terms(state["query"]) or state["query"].strip()
+        subject = _compact_query_terms(query) or query.strip()
         official_fallbacks = [
             f"{subject} 公式 発表",
             f"{subject} 公式 お知らせ",
@@ -1147,7 +798,7 @@ class ResearchWorkflowNodes:
             plan = SearchPlan(tasks=[
                 SearchTask(
                     aspect="総合調査",
-                    query=state["query"],
+                    query=query,
                     reason="元の質問に直接答えるための基本情報収集",
                 )
             ], official_queries=official_queries)
@@ -1160,6 +811,13 @@ class ResearchWorkflowNodes:
             self.log_detail(
                 f"通常検索 {regular_limit}件と公式検索 {official_limit}件の枠を確保します"
             )
+        return plan
+
+    def planner(self, state: State):
+        query = state["query"]
+        prompt = self._build_planner_prompt(query)
+        plan = self._request_search_plan(query, prompt)
+        plan = self._validate_search_plan(query, plan)
         return {"plan": plan}
 
     def dispatch_searches(self, state: State):
@@ -1324,99 +982,9 @@ class ResearchWorkflowNodes:
             "normal_search_query_count": 1,
         }
 
-    def evaluate(self, state: State):
-        all_results = deduplicate_results(
-            (state.get("evidence_results", []) or state.get("results", []))
-            + state.get("official_results", [])
-        )
-        unique_results = _evaluation_sources(
-            all_results, official_candidates=state.get("official_results", []),
-        )
-        cached_source_assessments: list[SourceAssessment] = []
-        assessment_targets: list[SearchResult] = []
-        for item in unique_results:
-            cached_assessment = self.source_assessment_cache.get(item.url, item.content)
-            if cached_assessment is None:
-                assessment_targets.append(item)
-            else:
-                cached_source_assessments.append(cached_assessment)
-        assessment_target_urls = {item.url for item in assessment_targets if item.url}
-        official_urls = {item.url for item in state.get("official_results", []) if item.url}
-        evaluation_urls = {item.url for item in unique_results if item.url}
-        for item in all_results:
-            if item.url in evaluation_urls:
-                decision = "included"
-                reason = "Included in quality evaluation evidence."
-            elif item.relevance_score is None:
-                decision = "excluded"
-                reason = "Missing relevance score."
-            elif item.relevance_score < MIN_RELEVANCE_FOR_EVALUATION:
-                decision = "excluded"
-                reason = f"Relevance score below {MIN_RELEVANCE_FOR_EVALUATION:.2f}."
-            else:
-                decision = "excluded"
-                reason = "Excluded by the maximum evidence-source limit."
-            self.log_source_trace(
-                "quality_evaluation", item, decision, reason,
-                official_candidate=item.url in official_urls,
-            )
-        relevance_eligible = [
-            item for item in all_results
-            if item.relevance_score is not None
-            and item.relevance_score >= MIN_RELEVANCE_FOR_EVALUATION
-        ]
-        excluded_count = len(all_results) - len(relevance_eligible)
-        if excluded_count:
-            self.log_detail(
-                f"品質評価から低関連ソース {excluded_count}件を除外しました "
-                f"（関連度 {MIN_RELEVANCE_FOR_EVALUATION:.2f} 未満）"
-            )
-        capped_count = len(relevance_eligible) - len(unique_results)
-        if capped_count:
-            self.log_detail(
-                f"品質評価の入力上限と出典分散により {capped_count}件を今回の評価対象から外しました "
-                f"（評価対象上限: {MAX_EVIDENCE_SOURCES}件）"
-            )
-        formatted_evidence = format_results_for_llm(unique_results)
-        if not formatted_evidence:
-            formatted_evidence = "No eligible evidence."
-        brief_context = research_brief_context(state.get("run_memo", ""), evaluation_urls)
-        assessment_targets_text = "\n".join(
-            f"- {item.url} | {item.title[:120]} | fetch={item.fetch_status or 'unknown'}"
-            for item in assessment_targets
-        ) or "none"
-        cached_assessments_text = "\n".join(
-            f"- {assessment.url} | credibility={assessment.credibility:.2f} | use={assessment.use_as_evidence} | {assessment.reason[:140]}"
-            for assessment in cached_source_assessments
-        ) or "none"
-        source_assessment_instruction = f"""
-Page-level source assessment:
-- Assess every URL in `URLs requiring assessment` and no other URL.
-- Judge this fetched page, not the reputation of its domain. Consider publisher/author attribution, editorial accountability, traceable primary evidence, independence, recency, and relevance to the user's question.
-- Set `use_as_evidence` to true only if the page directly supports a bounded claim in the final answer. Reject pages that are off-topic, lack a usable body, are unattributed reposts/aggregations, or make material claims without traceable support.
-- A registered official or trusted domain is a ranking signal, not automatic evidence acceptance.
-- Return concise reasons and a short `support_scope`; do not invent facts.
-URLs requiring assessment:
-{assessment_targets_text}
-Previously cached page assessments (reuse unless the current evidence contradicts them):
-{cached_assessments_text}
-"""
-        prompt = f"""You are a web-research quality evaluator (リサーチ品質評価担当). Return exactly one valid JSON object, with no prose or reasoning tags.
-Date: {self.current_date}
-Question: {state['query']}
-Plan: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
-Evidence (each item has a URL and retrieved page text when available):
-{formatted_evidence}
-{source_assessment_instruction}
-Rules:
-- Decide whether the evidence answers the question without unsupported claims.
-- Prefer direct primary evidence for material facts. Secondary evidence must be relevant and independently traceable; a domain label alone is never enough. 二次情報であることだけを理由に証拠を弱いと判定してはいけません。
-- For material secondary claims, seek independent support from at least two different publisher domains; syndicated or reposted copies do not count. 異なる発行元ドメインの2件以上を目安にし、転載・再掲は独立根拠として数えません。
-- Mark missing, stale, contradictory, inaccessible, or unsupported material as insufficient. Do not claim that a source exists or is absent unless the evidence shows it.
-- Add short search-engine queries only for information that would materially improve the answer. Put first-party or official-document searches in `official_additional_queries`.
-Return this JSON schema (keep strings concise):
-{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"","additional_queries":[],"official_additional_queries":[],"source_assessments":[{{"url":"","credibility":0.0,"use_as_evidence":false,"reason":"","support_scope":""}}]}}
-"""
+    def _run_evaluation_with_repair(
+        self, prompt: str, state: State, unique_results: list[SearchResult],
+    ) -> tuple[Evaluation, bool]:
         raw_evaluation = ""
         evaluation_failed = False
         try:
@@ -1472,7 +1040,16 @@ JSON例:
                     additional_queries=fallback_queries,
                     official_additional_queries=[],
                 )
+        return eval_obj, evaluation_failed
 
+    def _apply_source_assessments(
+        self,
+        eval_obj: Evaluation,
+        unique_results: list[SearchResult],
+        assessment_target_urls: set[str],
+        cached_source_assessments: list[SourceAssessment],
+        official_urls: set[str],
+    ) -> None:
         fresh_source_assessments = [
             assessment for assessment in eval_obj.source_assessments
             if assessment.url in assessment_target_urls
@@ -1505,6 +1082,9 @@ JSON例:
                 page_assessment=assessment,
             )
 
+    def _prepare_evaluation_followups(
+        self, eval_obj: Evaluation, state: State, evaluation_failed: bool,
+    ) -> None:
         proposed_queries = eval_obj.additional_queries
         proposed_official_queries = eval_obj.official_additional_queries
         try:
@@ -1550,6 +1130,7 @@ JSON例:
             else:
                 self.log_detail("不足項目に対応する未検索のキーワードがないため、追加検索を終了します")
 
+    def _finalize_evaluation(self, eval_obj: Evaluation) -> None:
         eval_obj.sufficient = eval_obj.sufficient and not (
             eval_obj.additional_queries or eval_obj.official_additional_queries
             or eval_obj.missing_information or eval_obj.weak_evidence
@@ -1572,9 +1153,125 @@ JSON例:
                 f"Source assessment: {decision} | credibility={assessment.credibility:.2f} | "
                 f"{assessment.url} | {assessment.reason}"
             )
+
+    def _build_evaluation_prompt(
+        self,
+        state: State,
+        unique_results: list[SearchResult],
+        assessment_targets: list[SearchResult],
+        cached_source_assessments: list[SourceAssessment],
+    ) -> str:
+        formatted_evidence = format_results_for_llm(unique_results)
+        if not formatted_evidence:
+            formatted_evidence = "No eligible evidence."
+        assessment_targets_text = "\n".join(
+            f"- {item.url} | {item.title[:120]} | fetch={item.fetch_status or 'unknown'}"
+            for item in assessment_targets
+        ) or "none"
+        cached_assessments_text = "\n".join(
+            f"- {assessment.url} | credibility={assessment.credibility:.2f} | use={assessment.use_as_evidence} | {assessment.reason[:140]}"
+            for assessment in cached_source_assessments
+        ) or "none"
+        source_assessment_instruction = f"""
+Page-level source assessment:
+- Assess every URL in `URLs requiring assessment` and no other URL.
+- Judge this fetched page, not the reputation of its domain. Consider publisher/author attribution, editorial accountability, traceable primary evidence, independence, recency, and relevance to the user's question.
+- Set `use_as_evidence` to true only if the page directly supports a bounded claim in the final answer. Reject pages that are off-topic, lack a usable body, are unattributed reposts/aggregations, or make material claims without traceable support.
+- A registered official or trusted domain is a ranking signal, not automatic evidence acceptance.
+- Return concise reasons and a short `support_scope`; do not invent facts.
+URLs requiring assessment:
+{assessment_targets_text}
+Previously cached page assessments (reuse unless the current evidence contradicts them):
+{cached_assessments_text}
+"""
+        prompt = f"""You are a web-research quality evaluator (リサーチ品質評価担当). Return exactly one valid JSON object, with no prose or reasoning tags.
+Date: {self.current_date}
+Question: {state['query']}
+Plan: {state['plan'].model_dump_json() if hasattr(state.get('plan'), 'model_dump_json') else str(state.get('plan', ''))}
+Evidence (each item has a URL and retrieved page text when available):
+{formatted_evidence}
+{source_assessment_instruction}
+Rules:
+- Decide whether the evidence answers the question without unsupported claims.
+- Prefer direct primary evidence for material facts. Secondary evidence must be relevant and independently traceable; a domain label alone is never enough. 二次情報であることだけを理由に証拠を弱いと判定してはいけません。
+- For material secondary claims, seek independent support from at least two different publisher domains; syndicated or reposted copies do not count. 異なる発行元ドメインの2件以上を目安にし、転載・再掲は独立根拠として数えません。
+- Mark missing, stale, contradictory, inaccessible, or unsupported material as insufficient. Do not claim that a source exists or is absent unless the evidence shows it.
+- Add short search-engine queries only for information that would materially improve the answer. Put first-party or official-document searches in `official_additional_queries`.
+Return this JSON schema (keep strings concise):
+{{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"","additional_queries":[],"official_additional_queries":[],"source_assessments":[{{"url":"","credibility":0.0,"use_as_evidence":false,"reason":"","support_scope":""}}]}}
+"""
+        return prompt
+
+    def evaluate(self, state: State):
+        all_results = deduplicate_results(
+            (state.get("evidence_results", []) or state.get("results", []))
+            + state.get("official_results", [])
+        )
+        unique_results = _evaluation_sources(
+            all_results, official_candidates=state.get("official_results", []),
+        )
+        cached_source_assessments: list[SourceAssessment] = []
+        assessment_targets: list[SearchResult] = []
+        for item in unique_results:
+            cached_assessment = self.source_assessment_cache.get(item.url, item.content)
+            if cached_assessment is None:
+                assessment_targets.append(item)
+            else:
+                cached_source_assessments.append(cached_assessment)
+        assessment_target_urls = {item.url for item in assessment_targets if item.url}
+        official_urls = {item.url for item in state.get("official_results", []) if item.url}
+        evaluation_urls = {item.url for item in unique_results if item.url}
+        for item in all_results:
+            if item.url in evaluation_urls:
+                decision = "included"
+                reason = "Included in quality evaluation evidence."
+            elif item.relevance_score is None:
+                decision = "excluded"
+                reason = "Missing relevance score."
+            elif item.relevance_score < MIN_RELEVANCE_FOR_EVALUATION:
+                decision = "excluded"
+                reason = f"Relevance score below {MIN_RELEVANCE_FOR_EVALUATION:.2f}."
+            else:
+                decision = "excluded"
+                reason = "Excluded by the maximum evidence-source limit."
+            self.log_source_trace(
+                "quality_evaluation", item, decision, reason,
+                official_candidate=item.url in official_urls,
+            )
+        relevance_eligible = [
+            item for item in all_results
+            if item.relevance_score is not None
+            and item.relevance_score >= MIN_RELEVANCE_FOR_EVALUATION
+        ]
+        excluded_count = len(all_results) - len(relevance_eligible)
+        if excluded_count:
+            self.log_detail(
+                f"品質評価から低関連ソース {excluded_count}件を除外しました "
+                f"（関連度 {MIN_RELEVANCE_FOR_EVALUATION:.2f} 未満）"
+            )
+        capped_count = len(relevance_eligible) - len(unique_results)
+        if capped_count:
+            self.log_detail(
+                f"品質評価の入力上限と出典分散により {capped_count}件を今回の評価対象から外しました "
+                f"（評価対象上限: {MAX_EVIDENCE_SOURCES}件）"
+            )
+        prompt = self._build_evaluation_prompt(
+            state, unique_results, assessment_targets, cached_source_assessments,
+        )
+        eval_obj, evaluation_failed = self._run_evaluation_with_repair(
+            prompt, state, unique_results,
+        )
+        self._apply_source_assessments(
+            eval_obj, unique_results, assessment_target_urls,
+            cached_source_assessments, official_urls,
+        )
+        self._prepare_evaluation_followups(eval_obj, state, evaluation_failed)
+        self._finalize_evaluation(eval_obj)
         return {"evaluation": eval_obj}
 
-    def update_board(self, state: State):
+    def _collect_board_context(
+        self, state: State,
+    ) -> BoardContext:
         evaluation = state.get("evaluation")
         all_results = deduplicate_results(
             (state.get("evidence_results", []) or state.get("results", []))
@@ -1613,7 +1310,6 @@ JSON例:
                 "reason": reason[:180],
                 "credibility": credibility,
             })
-        known_source_urls = {item["url"] for item in source_items}
         evaluation_summary = {
             "sufficient": evaluation.sufficient if evaluation else False,
             "reason": (evaluation.reason if evaluation else "Not evaluated")[:240],
@@ -1628,6 +1324,25 @@ JSON例:
             "source_decisions": source_items,
             "next_action": evaluation_summary["reason"],
         }
+        return BoardContext(
+            board_sources=board_sources,
+            source_items=source_items,
+            evaluation_summary=evaluation_summary,
+            fallback_payload=fallback_payload,
+            current_memo=current_memo,
+        )
+
+    def _request_board_memo(
+        self,
+        state: State,
+        context: BoardContext,
+    ) -> dict[str, Any]:
+        board_sources = context.board_sources
+        source_items = context.source_items
+        evaluation_summary = context.evaluation_summary
+        fallback_payload = context.fallback_payload
+        current_memo = context.current_memo
+        known_source_urls = {item["url"] for item in source_items}
         memo_payload: dict[str, Any] = fallback_payload
         if self.settings.memo_keeper_enabled:
             prompt = f"""You are a memo keeper for one research run. Update a compact JSON memo only; do not answer the user's question.
@@ -1675,9 +1390,14 @@ Return exactly this JSON schema:
                 self.log_detail("メモキーパー: 独立した短文メモを更新しました")
             except Exception as error:
                 self.log_detail(f"メモキーパーに失敗したため決定論的メモへフォールバックしました: {type(error).__name__}")
+        return memo_payload
+
+    def update_board(self, state: State):
+        context = self._collect_board_context(state)
+        memo_payload = self._request_board_memo(state, context)
         memo = json.dumps(memo_payload, ensure_ascii=False, separators=(",", ":"))
         if len(memo) > self.settings.memo_keeper_max_chars:
-            memo = json.dumps(fallback_payload, ensure_ascii=False, separators=(",", ":"))
+            memo = json.dumps(context.fallback_payload, ensure_ascii=False, separators=(",", ":"))
         if self.board_update is not None:
             self.board_update(memo)
         return {"run_memo": memo}
@@ -1840,7 +1560,7 @@ Return exactly this JSON schema:
             "normal_search_query_count": len(queries),
         }
 
-    def analyze(self, state: State):
+    def _select_final_evidence(self, state: State) -> list[SearchResult]:
         candidate_results = deduplicate_results(
             (state.get("evidence_results", []) or state.get("results", []))
             + state.get("official_results", [])
@@ -1882,16 +1602,11 @@ Return exactly this JSON schema:
                 official_candidate=item.url in official_urls,
                 page_assessment=assessment,
             )
-        if not unique_results:
-            self.log_detail("Final answer skipped: no eligible evidence remained after assessment.")
-            return {
-                "summary": (
-                    "## \u8abf\u67fb\u7d50\u679c\n\n"
-                    "\u6700\u7d42\u56de\u7b54\u306e\u6839\u62e0\u3068\u3057\u3066\u63a1\u7528\u3067\u304d\u308b\u60c5\u5831\u6e90\u304c\u6b8b\u3089\u306a\u304b\u3063\u305f\u305f\u3081\u3001"
-                    "\u6839\u62e0\u306e\u306a\u3044\u56de\u7b54\u306f\u751f\u6210\u3057\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u691c\u7d22\u6761\u4ef6\u3084\u767b\u9332\u30c9\u30e1\u30a4\u30f3\u3092\u898b\u76f4\u3057\u3001"
-                    "\u518d\u8abf\u67fb\u3057\u3066\u304f\u3060\u3055\u3044\u3002"
-                )
-            }
+        return unique_results
+
+    def _build_final_answer_prompt(
+        self, state: State, unique_results: list[SearchResult],
+    ) -> tuple[str, str, str]:
         formatted_evidence = format_results_for_llm(unique_results)
         evaluation = state.get("evaluation")
         quality_note = ""
@@ -1903,6 +1618,7 @@ Return exactly this JSON schema:
 評価理由: {evaluation.reason}
 未確認事項: {", ".join(evaluation.missing_information) or "なし"}
 レポートでは冒頭に調査が不完全であることを明記し、根拠から確認できる範囲と未確認事項を区別してください。"""
+        final_urls = {item.url for item in unique_results if item.url}
         brief_context = research_brief_context(state.get("run_memo", ""), final_urls)
         answer_prompt = f"""以下のWeb検索結果および取得したWebページ本文だけを根拠に質問へ回答してください。
 現在日（この調査の基準日）: {self.current_date}
@@ -1923,16 +1639,16 @@ Return exactly this JSON schema:
 5. 取得情報から確認できないことは断定せず、調査品質が不十分な場合はその制約を明記してください。
 6. 元の質問で求められていない性能・育成・ガチャ詳細を必須情報のように付け加えず、公式確定情報とリーク・予想を明確に分けてください。
 7. 思考過程や自己対話は出力せず、完成したレポート本文だけを出力してください。<think>等のタグも含めないでください。"""
-        try:
-            answer = strip_model_reasoning(self.invoke_llm(
-                "final_answer", answer_prompt, llm=self.answer_llm, source_count=len(unique_results),
-            ).content)
-        except EmptyModelResponseError as error:
-            self.log_detail(f"Final answer generation produced no content: {error}")
-            return {"summary": (
-                "調査結果を生成できませんでした。LM Studioでこのモデルの思考モードを無効化するか、"
-                "役割別の出力上限を増やしてから再実行してください。"
-            )}
+        return answer_prompt, formatted_evidence, quality_note
+
+    def _ensure_answer_citations(
+        self,
+        state: State,
+        answer: str,
+        unique_results: list[SearchResult],
+        formatted_evidence: str,
+        quality_note: str,
+    ) -> str:
         issues = citation_issues(answer, len(unique_results))
         has_citations = bool(_SOURCE_REF_RE.search(answer))
         if unique_results and (issues or not has_citations):
@@ -1964,7 +1680,36 @@ Return exactly this JSON schema:
                 self.log_detail(f"Citation retry produced no content; keeping the first answer: {error}")
         else:
             self.log_detail("出典検証: 出典番号の形式と範囲を確認しました（主張の裏付けは未検証）")
+        return answer
 
+    def analyze(self, state: State):
+        unique_results = self._select_final_evidence(state)
+        if not unique_results:
+            self.log_detail("Final answer skipped: no eligible evidence remained after assessment.")
+            return {
+                "summary": (
+                    "## \u8abf\u67fb\u7d50\u679c\n\n"
+                    "\u6700\u7d42\u56de\u7b54\u306e\u6839\u62e0\u3068\u3057\u3066\u63a1\u7528\u3067\u304d\u308b\u60c5\u5831\u6e90\u304c\u6b8b\u3089\u306a\u304b\u3063\u305f\u305f\u3081\u3001"
+                    "\u6839\u62e0\u306e\u306a\u3044\u56de\u7b54\u306f\u751f\u6210\u3057\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u691c\u7d22\u6761\u4ef6\u3084\u767b\u9332\u30c9\u30e1\u30a4\u30f3\u3092\u898b\u76f4\u3057\u3001"
+                    "\u518d\u8abf\u67fb\u3057\u3066\u304f\u3060\u3055\u3044\u3002"
+                )
+            }
+        answer_prompt, formatted_evidence, quality_note = self._build_final_answer_prompt(
+            state, unique_results,
+        )
+        try:
+            answer = strip_model_reasoning(self.invoke_llm(
+                "final_answer", answer_prompt, llm=self.answer_llm, source_count=len(unique_results),
+            ).content)
+        except EmptyModelResponseError as error:
+            self.log_detail(f"Final answer generation produced no content: {error}")
+            return {"summary": (
+                "調査結果を生成できませんでした。LM Studioでこのモデルの思考モードを無効化するか、"
+                "役割別の出力上限を増やしてから再実行してください。"
+            )}
+        answer = self._ensure_answer_citations(
+            state, answer, unique_results, formatted_evidence, quality_note,
+        )
         return {"summary": render_verified_sources(answer, unique_results)}
 
 

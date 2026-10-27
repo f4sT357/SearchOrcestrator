@@ -32,9 +32,11 @@ search-orchestrator-gui = "gui.run:main"
 [tool.setuptools]
 py-modules = [
     "app_settings",
+    "evaluation_helpers",
     "fallback_fetcher",
     "lmstudio_client",
     "main",
+    "research_models",
     "search_orchestrator",
     "source_assessment",
     "source_scoring",

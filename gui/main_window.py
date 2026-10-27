@@ -6,11 +6,10 @@ import datetime
 from dataclasses import replace
 import os
 import sys
-from threading import Thread
 from typing import Any
 
-from PySide6.QtCore import QDateTime, QUrl, Qt
-from PySide6.QtGui import QDesktopServices, QFont, QIcon
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,7 +30,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -48,16 +46,16 @@ if parent_dir not in sys.path:
 
 import json
 from gui.workflow_view import WorkflowProgressView
+from gui.styles import MAIN_WINDOW_STYLESHEET
 from PySide6.QtCore import QThreadPool
 from gui.worker import (
     ModelFetchRunnable,
     ModelLoadRunnable,
-    RerankerPreloadSignals,
     ResearchWorker,
     preload_reranker_background,
 )
 from search_orchestrator import (
-    SearchResult, Settings, fetch_available_models, normalize_official_domains,
+    SearchResult, Settings, normalize_official_domains,
 )
 
 
@@ -67,7 +65,6 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.worker: ResearchWorker | None = None
-        self.model_fetch_worker: ModelFetchWorker | None = None
         self.model_load_runnable: ModelLoadRunnable | None = None
         self.last_results: list[SearchResult] = []
         self.default_settings = Settings.from_environment()
@@ -106,6 +103,13 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(12)
 
+        main_layout.addLayout(self._create_header())
+        main_layout.addWidget(self._create_query_group())
+        main_layout.addWidget(self._create_settings_group())
+        main_layout.addLayout(self._create_status_layout())
+        main_layout.addWidget(self._create_result_tabs(), stretch=1)
+
+    def _create_header(self) -> QVBoxLayout:
         # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(2)
@@ -118,8 +122,9 @@ class MainWindow(QMainWindow):
         subtitle_label.setObjectName("subtitleLabel")
         header_layout.addWidget(title_label)
         header_layout.addWidget(subtitle_label)
-        main_layout.addLayout(header_layout)
+        return header_layout
 
+    def _create_query_group(self) -> QGroupBox:
         # Query Input Section
         input_group = QGroupBox("調査テーマ・質問", self)
         input_layout = QVBoxLayout(input_group)
@@ -146,14 +151,23 @@ class MainWindow(QMainWindow):
 
         button_row.addStretch()
         input_layout.addLayout(button_row)
-        main_layout.addWidget(input_group)
+        return input_group
 
+    def _create_settings_group(self) -> QGroupBox:
         # Settings Panel (Collapsible)
         self.settings_group = QGroupBox("詳細設定", self)
         self.settings_group.setVisible(False)
         settings_layout = QFormLayout(self.settings_group)
         settings_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        self._add_model_settings(settings_layout)
+        self._add_execution_settings(settings_layout)
+        self._add_candidate_settings(settings_layout)
+        self._add_ranking_weight_settings(settings_layout)
+        self._add_web_settings(settings_layout)
+        return self.settings_group
+
+    def _add_model_settings(self, settings_layout: QFormLayout) -> None:
         # Model selection with Combobox and Refresh button
         model_row = QHBoxLayout()
         self.model_combo = QComboBox(self)
@@ -226,6 +240,7 @@ class MainWindow(QMainWindow):
         )
         settings_layout.addRow("信頼済み二次ソース:", self.trusted_domains_edit)
 
+    def _add_execution_settings(self, settings_layout: QFormLayout) -> None:
         # Numeric Options
         num_row = QHBoxLayout()
         self.concurrency_spin = QSpinBox(self)
@@ -262,6 +277,7 @@ class MainWindow(QMainWindow):
 
         settings_layout.addRow("実行制御:", num_row)
 
+    def _add_candidate_settings(self, settings_layout: QFormLayout) -> None:
         candidate_row = QHBoxLayout()
         self.results_per_query_spin = QSpinBox(self)
         self.results_per_query_spin.setRange(1, 20)
@@ -300,6 +316,7 @@ class MainWindow(QMainWindow):
         self.results_per_query_spin.valueChanged.connect(self.content_candidates_spin.setMaximum)
         self.content_candidates_spin.valueChanged.connect(self.final_results_spin.setMaximum)
 
+    def _add_ranking_weight_settings(self, settings_layout: QFormLayout) -> None:
         weights_row = QHBoxLayout()
         self.relevance_weight_spin = QDoubleSpinBox(self)
         self.trust_weight_spin = QDoubleSpinBox(self)
@@ -342,6 +359,7 @@ class MainWindow(QMainWindow):
         weights_row.addStretch()
         settings_layout.addRow("ソース順位の重み（合計100%）:", weights_row)
 
+    def _add_web_settings(self, settings_layout: QFormLayout) -> None:
         # Web Fetch Options
         web_row = QHBoxLayout()
         self.fetch_content_cb = QCheckBox("Webページの本文も読む", self)
@@ -398,8 +416,8 @@ class MainWindow(QMainWindow):
         self.firecrawl_api_key_edit.setPlaceholderText("不要なセルフホスト構成では空欄")
         self.firecrawl_api_key_edit.setToolTip("Firecrawlサービスに接続するための合言葉です。サービス側で設定していない場合は空欄にします。")
         settings_layout.addRow("Firecrawl APIキー (任意):", self.firecrawl_api_key_edit)
-        main_layout.addWidget(self.settings_group)
 
+    def _create_status_layout(self) -> QHBoxLayout:
         # Progress / Status Bar
         status_layout = QHBoxLayout()
         self.status_label = QLabel("待機中", self)
@@ -412,11 +430,20 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         status_layout.addWidget(self.progress_bar)
-        main_layout.addLayout(status_layout)
+        return status_layout
 
+    def _create_result_tabs(self) -> QTabWidget:
         # Tabs for Results, Sources, the live research board, and Logs
         self.tabs = QTabWidget(self)
 
+        self._add_summary_tab()
+        self._add_sources_tab()
+        self._add_workflow_tab()
+        self._add_board_tab()
+        self._add_log_tab()
+        return self.tabs
+
+    def _add_summary_tab(self) -> None:
         # Tab 1: Summary Report
         summary_tab = QWidget()
         summary_layout = QVBoxLayout(summary_tab)
@@ -440,6 +467,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(summary_tab, "📄 調査レポート")
 
+    def _add_sources_tab(self) -> None:
         # Tab 2: Sources Table
         sources_tab = QWidget()
         sources_layout = QVBoxLayout(sources_tab)
@@ -465,6 +493,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(sources_tab, "🔗 参照ソース一覧")
 
+    def _add_workflow_tab(self) -> None:
         # Tab 3: Live workflow diagram
         workflow_tab = QWidget()
         workflow_layout = QVBoxLayout(workflow_tab)
@@ -477,6 +506,7 @@ class MainWindow(QMainWindow):
         workflow_layout.addWidget(workflow_scroll)
         self.tabs.addTab(workflow_tab, "🔄 調査の進行状況")
 
+    def _add_board_tab(self) -> None:
         # Tab 4: Live shared board
         board_tab = QWidget()
         board_layout = QVBoxLayout(board_tab)
@@ -489,6 +519,7 @@ class MainWindow(QMainWindow):
         board_layout.addWidget(self.board_edit)
         self.tabs.addTab(board_tab, "📌 調査ボード")
 
+    def _add_log_tab(self) -> None:
         # Tab 5: Execution Logs
         log_tab = QWidget()
         log_layout = QVBoxLayout(log_tab)
@@ -508,7 +539,6 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(log_tab, "🔎 詳細実行ログ")
 
-        main_layout.addWidget(self.tabs, stretch=1)
 
     def _toggle_settings(self, checked: bool) -> None:
         self.settings_group.setVisible(checked)
@@ -823,117 +853,4 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "コピー完了", "ソース一覧をクリップボードにコピーしました。")
 
     def _apply_stylesheet(self) -> None:
-        self.setStyleSheet("""
-            QWidget {
-                font-family: 'Segoe UI', 'Meiryo', sans-serif;
-                font-size: 13px;
-                color: #2b2b2b;
-            }
-            QMainWindow {
-                background-color: #f6f8fa;
-            }
-            #titleLabel {
-                font-size: 20px;
-                font-weight: bold;
-                color: #1a1f2c;
-            }
-            #subtitleLabel {
-                font-size: 12px;
-                color: #57606a;
-                margin-bottom: 4px;
-            }
-            QGroupBox {
-                background-color: #ffffff;
-                border: 1px solid #d0d7de;
-                border-radius: 8px;
-                margin-top: 10px;
-                font-weight: bold;
-                padding-top: 14px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-                color: #24292f;
-            }
-            #startBtn {
-                background-color: #2da44e;
-                color: #ffffff;
-                font-size: 14px;
-                font-weight: bold;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 20px;
-                min-height: 24px;
-            }
-            #startBtn:hover {
-                background-color: #2c974b;
-            }
-            #startBtn:disabled {
-                background-color: #94d3a2;
-            }
-            #secondaryBtn, QPushButton {
-                background-color: #f6f8fa;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                padding: 6px 14px;
-                color: #24292f;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background-color: #f3f4f6;
-                border-color: #1b1f2426;
-            }
-            QTextEdit, QPlainTextEdit, QLineEdit, QSpinBox {
-                background-color: #ffffff;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QTextEdit:focus, QPlainTextEdit:focus, QLineEdit:focus, QSpinBox:focus {
-                border: 2px solid #0969da;
-            }
-            QTabWidget::pane {
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-                background-color: #ffffff;
-            }
-            QTabBar::tab {
-                background-color: #eaeef2;
-                border: 1px solid #d0d7de;
-                border-bottom: none;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                font-weight: 500;
-            }
-            QTabBar::tab:selected {
-                background-color: #ffffff;
-                border-bottom: 1px solid #ffffff;
-            }
-            QProgressBar {
-                border: 1px solid #d0d7de;
-                border-radius: 7px;
-                background-color: #eaeef2;
-            }
-            QProgressBar::chunk {
-                background-color: #0969da;
-                border-radius: 6px;
-            }
-            #statusLabel {
-                font-weight: bold;
-                color: #24292f;
-            }
-            QTableWidget {
-                gridline-color: #e1e4e8;
-                border: 1px solid #d0d7de;
-                border-radius: 6px;
-            }
-            QHeaderView::section {
-                background-color: #f6f8fa;
-                padding: 4px;
-                border: 1px solid #d0d7de;
-                font-weight: bold;
-            }
-        """)
+        self.setStyleSheet(MAIN_WINDOW_STYLESHEET)
