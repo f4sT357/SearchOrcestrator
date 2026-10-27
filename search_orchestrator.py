@@ -1948,7 +1948,13 @@ JSON例:
         normal = state.get("pending_normal_queries", [])
         official = state.get("pending_official_queries", [])
         if normal:
-            sends.append(Send("additional_search", {"queries": normal}))
+            sends.append(Send("additional_search", {
+                "queries": normal,
+                "existing_urls": [item.url for item in
+                    state.get("results", []) + state.get("evidence_results", [])
+                    + state.get("official_results", []) if item.url],
+                "search_round": state.get("search_round", 0),
+            }))
         if official:
             sends.append(Send("official_additional_search", {
                 "official_queries": official,
@@ -1961,7 +1967,7 @@ JSON例:
     def additional_search(self, state: State):
         queries = state.get("queries", [])
         self.log_detail(f"通常レーンの追加検索: {len(queries)}件")
-        existing_urls = {
+        existing_urls = set(state.get("existing_urls", [])) | {
             item.url for item in state.get("results", []) + state.get("evidence_results", [])
             if item.url
         }
@@ -2038,7 +2044,8 @@ JSON例:
 
     def analyze(self, state: State):
         candidate_results = deduplicate_results(
-            state.get("results", []) + state.get("official_results", [])
+            (state.get("evidence_results", []) or state.get("results", []))
+            + state.get("official_results", [])
         )
         unique_results = _evaluation_sources(
             candidate_results, official_candidates=state.get("official_results", []),
@@ -2100,7 +2107,7 @@ JSON例:
 {quality_note or "特段の不足は検出されていません。"}"""
             answer = strip_model_reasoning(self.llm.invoke(retry_prompt).content)
         else:
-            self.log_detail("出典検証: 回答中の出典番号は取得済みソースと照合できました")
+            self.log_detail("出典検証: 出典番号の形式と範囲を確認しました（主張の裏付けは未検証）")
 
         return {"summary": render_verified_sources(answer, unique_results)}
 
@@ -2152,3 +2159,4 @@ def create_workflow(
     builder.add_edge("official_additional_search", "evaluate")
     builder.add_edge("analyze", END)
     return builder.compile()
+
