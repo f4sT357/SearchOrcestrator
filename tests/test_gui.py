@@ -25,6 +25,7 @@ def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
 
     window = MainWindow()
     window.config_path = str(tmp_path / "config.json")
+    (tmp_path / "config.json").write_text(json.dumps({"reranker_model": "custom-model", "fetch_timeout": 17}), encoding="utf-8")
     assert window.windowTitle() == "Search Orchestrator - AI Web Research Assistant"
     assert window.query_edit.toPlainText() != ""
     assert window.tabs.count() == 5
@@ -37,6 +38,8 @@ def test_gui_main_window_initialization(tmp_path, monkeypatch) -> None:
     window.firecrawl_api_key_edit.setText("firecrawl-secret")
     window._save_config()
     saved_config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert saved_config["reranker_model"] == "custom-model"
+    assert saved_config["fetch_timeout"] == 17
     assert "api_key" not in saved_config
     assert "use_fallback_fetcher" in saved_config
     assert saved_config["content_fetcher"] == "builtin"
@@ -78,3 +81,4 @@ def test_worker_logs_selected_fetcher_without_logging_api_key(monkeypatch) -> No
     assert "エンジン: Firecrawl セルフホスト" in initialization_log
     assert "API URL: http://localhost:3002" in initialization_log
     assert "do-not-log-this-key" not in initialization_log
+
