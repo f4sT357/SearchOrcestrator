@@ -8,6 +8,7 @@ from search_orchestrator import (
     SearchPlan,
     SearchResult,
     SearchTask,
+    ResearchWorkflowNodes,
     Settings,
     add_search_results,
     create_workflow,
@@ -20,6 +21,36 @@ from search_orchestrator import (
     render_verified_sources,
     select_diverse_results,
 )
+
+
+def test_followup_dispatch_preserves_prior_urls() -> None:
+    search = MagicMock()
+    search.text.return_value = [
+        {"href": "https://example.com/old", "title": "old", "body": ""},
+        {"href": "https://example.com/new", "title": "new", "body": ""},
+    ]
+    reranker = MagicMock()
+    reranker.predict.side_effect = lambda pairs, **kwargs: [0.8] * len(pairs)
+    nodes = ResearchWorkflowNodes(Settings(fetch_web_content=False), search=search,
+                                  reranker=reranker, llm=MagicMock())
+    old = SearchResult(query="first", title="old", url="https://example.com/old", snippet="")
+    send = nodes.dispatch_followups({"pending_normal_queries": ["followup"],
+                                     "results": [old], "search_round": 1})[0]
+    result = nodes.additional_search(send.arg)
+    assert [item.url for item in result["results"]] == ["https://example.com/new"]
+
+
+def test_final_answer_uses_evaluation_evidence_candidates() -> None:
+    llm = MagicMock()
+    llm.invoke.return_value.content = "Supported statement [S1]"
+    nodes = ResearchWorkflowNodes(Settings(fetch_web_content=False), search=MagicMock(),
+                                  reranker=MagicMock(), llm=llm)
+    evidence = SearchResult(query="q", title="Evidence", url="https://example.com/evidence",
+                            snippet="important evidence", relevance_score=0.8, combined_score=0.8)
+    result = nodes.analyze({"query": "q", "results": [], "evidence_results": [evidence],
+                            "official_results": [], "evaluation": None})
+    assert "important evidence" in llm.invoke.call_args.args[0]
+    assert "https://example.com/evidence" in result["summary"]
 
 
 def test_add_search_results_ignores_duplicate_urls() -> None:
@@ -495,3 +526,4 @@ def test_fetch_available_models_with_mock() -> None:
     with patch("httpx.Client.get", side_effect=Exception("Connection refused")):
         models_err = fetch_available_models("http://localhost:1234/v1")
         assert models_err == []
+
