@@ -85,4 +85,3 @@ def test_worker_logs_selected_fetcher_without_logging_api_key(monkeypatch) -> No
     assert "エンジン: Firecrawl セルフホスト" in initialization_log
     assert "API URL: http://localhost:3002" in initialization_log
     assert "do-not-log-this-key" not in initialization_log
-

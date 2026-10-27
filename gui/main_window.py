@@ -938,4 +938,3 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
             }
         """)
-
