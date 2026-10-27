@@ -9,7 +9,7 @@
 | ブランチ | 内容・状態 |
 | --- | --- |
 | [main](https://github.com/f4sT357/SearchOrcestrator/tree/main) | 基準となるブランチ。 |
-| [fix/research-workflow-maintainability](https://github.com/f4sT357/SearchOrcestrator/tree/fix/research-workflow-maintainability) | 追加検索の重複除外、GUI設定の引き継ぎ、品質評価と最終回答の根拠の整合性などを修正。mainには未反映。変更箇所の模擬テストは実施済みだが、依存ライブラリを使った既存テストとGUIの統合テストは未実施。 |
+| [fix/research-workflow-maintainability](https://github.com/f4sT357/SearchOrcestrator/tree/fix/research-workflow-maintainability) | 調査ワークフロー改善の作業ブランチ。コードレビュー、全90テスト、配布物のimport検証を完了し、mainへ統合済み。 |
 | [auto/improve-search-workflow-20260914](https://github.com/f4sT357/SearchOrcestrator/tree/auto/improve-search-workflow-20260914) | 検索ワークフロー改善用のブランチ。mainとの差分と現在の利用状況は要確認。 |
 
 変更ブランチをmainに取り込む前に、差分を確認し、依存関係を用意して `pytest -v` を実行してください。GUIや実際の検索に影響する変更は、該当機能の動作も確認します。
