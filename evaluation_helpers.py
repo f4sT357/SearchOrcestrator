@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from research_models import SearchResult
+from security import is_safe_url, safe_search_query, untrusted_data
 
 
 class Reranker(Protocol):
@@ -59,7 +61,15 @@ def _evaluation_sources(
     selected_secondary = select_diverse_results(
         remaining, max(0, MAX_EVIDENCE_SOURCES - len(selected_primary)),
     )
-    return selected_primary + selected_secondary
+    # A few adversarial, very long URLs cannot consume the entire context.
+    selected = []
+    url_chars = 0
+    for item in selected_primary + selected_secondary:
+        cost = len(_encoded_evidence(item.url))
+        if url_chars + cost <= MAX_EVIDENCE_CHARS // 2:
+            selected.append(item)
+            url_chars += cost
+    return selected
 
 
 def _query_anchor_terms(query: str) -> set[str]:
@@ -98,7 +108,7 @@ def _keyword_followup_query(
     if not subject:
         subject = original_query.strip()
 
-    facets = [_compact_query_terms(item) for item in missing_information]
+    facets = [_compact_query_terms(item) for item in missing_information if safe_search_query(item, original_query)]
     facets = [facet for facet in facets if facet]
     is_character_topic = any(
         kw in original_query.casefold()
@@ -111,7 +121,7 @@ def _keyword_followup_query(
     seen = {re.sub(r"\s+", " ", query).strip().casefold() for query in searched_queries}
     for facet in facets:
         query = re.sub(r"\s+", " ", f"{subject} {facet}").strip()
-        if query.casefold() not in seen:
+        if query.casefold() not in seen and safe_search_query(query, original_query):
             return query
     return None
 
@@ -125,6 +135,8 @@ def _validate_followup_queries(
     cleaned: list[str] = []
     seen: set[str] = set()
     for proposed in proposed_queries:
+        if not safe_search_query(proposed, original_query):
+            continue
         candidate = re.sub(r"\[\s*S?\d+\s*\]", " ", proposed, flags=re.IGNORECASE)
         candidate = candidate.strip().strip("[] \t\r\n:：-•")
         candidate = re.sub(r"^\d+[.)、:]\s*", "", candidate).strip()
@@ -153,7 +165,7 @@ def _validate_followup_queries(
         score = float(raw_score)
         candidate_folded = candidate.casefold()
         contains_anchor = any(term in candidate_folded for term in anchors)
-        if score < MIN_RELEVANCE_FOR_FOLLOWUP_QUERY or (
+        if not math.isfinite(score) or score < MIN_RELEVANCE_FOR_FOLLOWUP_QUERY or (
             anchors and not contains_anchor and score < 0.75
         ):
             continue
@@ -165,7 +177,7 @@ def deduplicate_results(results: list[SearchResult]) -> list[SearchResult]:
     seen: set[str] = set()
     unique: list[SearchResult] = []
     for item in results:
-        if item.url and item.url not in seen:
+        if is_safe_url(item.url) and item.url not in seen:
             seen.add(item.url)
             unique.append(item)
     return unique
@@ -187,30 +199,54 @@ def select_diverse_results(results: list[SearchResult], top_k: int) -> list[Sear
     return (diverse + remaining)[:max(0, top_k)]
 
 
-def format_results_for_llm(results: list[SearchResult]) -> str:
-    """Format multiple sources while keeping total evidence within a prompt budget."""
-    entries = []
-    fixed_chars = 0
-    for i, item in enumerate(results, start=1):
-        heading = f"--- 検索結果 #{i} / 出典番号 [S{i}] / 検索クエリ: {item.query} ---\n"
-        metadata = item.model_copy(update={"content": None}).to_evidence_text()
-        fixed = f"{heading}{metadata}"
-        entries.append((fixed, item.content or ""))
-        fixed_chars += len(fixed) + 2
+def _encoded_evidence(value) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
 
-    remaining_body_chars = max(0, MAX_EVIDENCE_CHARS - fixed_chars)
+
+def format_results_for_llm(results: list[SearchResult]) -> str:
+    """Bound serialized metadata AND bodies, preserving every selected URL."""
+    if not results:
+        return ""
+    envelope = len(untrusted_data("web_evidence", [])) - 2
+    limit = MAX_EVIDENCE_CHARS - envelope
+    scale = 1.0
+    while True:
+        fixed = []
+        for i, item in enumerate(results, start=1):
+            heading = f"--- 検索結果 #{i} / 出典番号 [S{i}] / 検索クエリ: {item.query[:int(300 * scale)]} ---\n"
+            metadata = item.model_copy(update={
+                "content": None, "title": item.title[:int(200 * scale)],
+                "snippet": item.snippet[:int(500 * scale)],
+            }).to_evidence_text()
+            fixed.append(heading + metadata)
+        fixed_size = len(_encoded_evidence(fixed))
+        if fixed_size <= limit:
+            break
+        if scale == 0:
+            # Internal selection reserves URL space first. Public callers with
+            # an impossible URL-only budget receive no partial source mapping.
+            return untrusted_data("web_evidence", "Evidence metadata exceeds input budget.")
+        scale = scale / 2 if scale > 0.01 else 0
+
+    remaining = limit - fixed_size
     parts = []
-    remaining_sources = len(entries)
-    for fixed, body in entries:
-        body_limit = remaining_body_chars // max(remaining_sources, 1)
-        excerpt = body[:body_limit]
-        if len(body) > len(excerpt):
-            excerpt += "\n（本文は全体の入力上限に合わせて省略）"
-        part = fixed + (f"\n【Webページ本文抜粋】:\n{excerpt}" if excerpt else "")
+    for index, (metadata, item) in enumerate(zip(fixed, results, strict=True)):
+        body = (item.content or "")[:MAX_EVIDENCE_CHARS]
+        allowance = remaining // (len(results) - index)
+        prefix = "\n【Webページ本文抜粋】:\n"
+        base_size = len(_encoded_evidence(metadata))
+        low, high = 0, len(body)
+        while low < high:
+            middle = (low + high + 1) // 2
+            cost = len(_encoded_evidence(metadata + prefix + body[:middle])) - base_size
+            if cost <= allowance:
+                low = middle
+            else:
+                high = middle - 1
+        part = metadata + prefix + body[:low] if low else metadata
+        remaining -= len(_encoded_evidence(part)) - base_size
         parts.append(part)
-        remaining_body_chars = max(0, remaining_body_chars - min(len(body), body_limit))
-        remaining_sources -= 1
-    return "\n\n".join(parts)
+    return untrusted_data("web_evidence", parts)
 
 
 def parse_json_from_response(text: str) -> dict:

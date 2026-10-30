@@ -58,18 +58,11 @@ def test_default_fetcher_detects_meta_charset() -> None:
     japanese_text = "これは日本語のテストページです。"
     html_bytes = f'<html><head><meta charset="utf-8"></head><body><p>{japanese_text}</p></body></html>'.encode("utf-8")
 
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.encoding = "iso-8859-1"  # simulated incorrect HTTP charset header
-    mock_resp.content = html_bytes
-    mock_resp.text = html_bytes.decode("iso-8859-1")
-    mock_resp.headers = {"content-type": "text/html"}
-    mock_resp.raise_for_status = MagicMock()
-
-    with patch("httpx.Client") as mock_client:
-        instance = mock_client.return_value.__enter__.return_value
-        instance.get.return_value = mock_resp
-        result = fetcher.fetch("https://example.com/jp")
+    import httpx
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+        200, content=html_bytes, headers={"content-type": "text/html; charset=iso-8859-1"}
+    ))) as client:
+        result = DefaultWebContentFetcher(client=client).fetch("https://example.com/jp")
 
     assert japanese_text in result
 

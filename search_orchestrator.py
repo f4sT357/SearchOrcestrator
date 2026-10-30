@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html
 import math
 import re
 import time
@@ -15,10 +16,12 @@ from typing import Any, Callable, Protocol
 import httpx
 from ddgs import DDGS
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from app_settings import Settings
+from security import SECURITY_INSTRUCTIONS, safe_search_query, security_event, untrusted_data
 from evaluation_helpers import (
     MAX_EVIDENCE_SOURCES,
     MIN_RELEVANCE_FOR_EVALUATION,
@@ -160,11 +163,13 @@ def add_search_results(results: list[SearchResult], response, query: str) -> int
     added_count = 0
     for item in response:
         url = item.get("href", "")
-        if not url or url in existing_urls:
+        if not is_safe_url(url) or url in existing_urls:
+            if url and not is_safe_url(url):
+                security_event("blocked_search_result_url", url)
             continue
         results.append(SearchResult(
-            query=query, title=item.get("title", ""), url=url,
-            snippet=item.get("body", ""),
+            query=query, title=str(item.get("title", ""))[:500], url=url,
+            snippet=str(item.get("body", ""))[:2000],
         ))
         existing_urls.add(url)
         added_count += 1
@@ -182,7 +187,7 @@ def rerank_results(
     official_domains: tuple[str, ...] = (),
     trusted_domains: tuple[str, ...] = (),
 ) -> list[SearchResult]:
-    valid_results = [item for item in results if item.url]
+    valid_results = [item for item in results if is_safe_url(item.url)]
     if not valid_results:
         return []
     pairs = [(item.query, f"{item.title}\n{item.snippet}") for item in valid_results]
@@ -230,6 +235,9 @@ def populate_content(
         return results
     updated: list[SearchResult] = []
     for item in results:
+        if not is_safe_url(item.url):
+            security_event("blocked_content_url", item.url)
+            continue
         if item.content is not None or not item.url:
             updated.append(item)
             continue
@@ -248,6 +256,9 @@ def populate_content(
         except FetchError as exc:
             status = (exc.status or FetchStatus.FAILED).value
             failure_reasons.append(f"primary={status}")
+            if exc.status == FetchStatus.BLOCKED:
+                updated.append(item.model_copy(update={"fetch_status": status, "fetch_error": "primary=blocked"}))
+                continue
         except Exception:
             failure_reasons.append("primary=failed")
 
@@ -334,7 +345,11 @@ def render_verified_sources(text: str, results: list[SearchResult]) -> str:
     # URLs are emitted only by this renderer, from the retrieved source list.
     cleaned = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", cleaned, flags=re.IGNORECASE)
     cleaned = _INLINE_URL_RE.sub("", cleaned)
-    cleaned = cleaned.rstrip()
+    # Model text cannot create active Markdown/HTML links, images or reference
+    # definitions. Only the program-generated source list may contain links.
+    cleaned = html.escape(cleaned, quote=False)
+    cleaned = cleaned.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    cleaned = re.sub(r"\\\[(S\d+)\\\]", r"[\1]", cleaned).rstrip()
 
     if not used_numbers:
         cleaned += "\n\n> 注: 出典番号を確認できなかったため、本文の主張と取得ソースの対応を検証できていません。"
@@ -345,10 +360,8 @@ def render_verified_sources(text: str, results: list[SearchResult]) -> str:
         cleaned += "\n\n## 参照ソース\n"
         for number in used_numbers:
             item = results[number - 1]
-            title = (item.title.replace("\r", " ").replace("\n", " ")
-                     .replace("[", "\\[").replace("]", "\\]")
-                     .replace("(", "\\(").replace(")", "\\)")) or item.url
-            if item.url.startswith(("http://", "https://")):
+            title = html.escape(re.sub(r"([\\`*_{}\[\]()!])", r"\\\1", item.title.replace("\r", " ").replace("\n", " ")), quote=False) or "Source"
+            if is_safe_url(item.url):
                 safe_url = item.url.replace("<", "%3C").replace(">", "%3E").replace(" ", "%20")
                 cleaned += f"- [S{number}] [{title}](<{safe_url}>)\n"
             else:
@@ -444,6 +457,10 @@ class ResearchWorkflowNodes:
         progress: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.settings = settings
+        if (settings.fetch_web_content
+                and (settings.content_fetcher == "firecrawl" or settings.use_fallback_fetcher)
+                and settings.remote_fetchers_network_isolated is not True):
+            raise ValueError("Firecrawl/Jina require public-only service egress. Use builtin or set remote_fetchers_network_isolated only after enforcing service isolation.")
         assessment_cache_dir = Path(settings.source_assessment_cache_dir)
         if not assessment_cache_dir.is_absolute():
             assessment_cache_dir = Path(__file__).resolve().parent / assessment_cache_dir
@@ -499,6 +516,7 @@ class ResearchWorkflowNodes:
                 fetcher = FirecrawlFetcher(
                     api_url=settings.firecrawl_api_url,
                     api_key=settings.firecrawl_api_key,
+                    network_isolated=settings.remote_fetchers_network_isolated,
                 )
             else:
                 cache_dir = Path(settings.web_cache_dir)
@@ -514,13 +532,24 @@ class ResearchWorkflowNodes:
             fetcher = None
         self.fetcher = fetcher
         if fallback_fetcher is None and settings.use_fallback_fetcher:
-            fallback_fetcher = JinaReaderFetcher(api_url=settings.jina_api_url)
+            fallback_fetcher = JinaReaderFetcher(api_url=settings.jina_api_url,
+                                                network_isolated=settings.remote_fetchers_network_isolated)
         self.fallback_fetcher = fallback_fetcher
         self.current_date = date.today().isoformat()
 
     def log_detail(self, message: str) -> None:
         if self.log is not None:
+            for secret in (self.settings.api_key, self.settings.firecrawl_api_key):
+                if secret and len(secret) >= 8:
+                    message = message.replace(secret, "[REDACTED]")
+            message = re.sub(r"(https?://[^\s\"<>?]+)\?[^\s\"<>]*", r"\1?[REDACTED]", message)
             self.log(message)
+
+    def _search_text(self, query: str, *, max_results: int, original_query: str = ""):
+        if not safe_search_query(query, original_query, secrets=(self.settings.api_key, self.settings.firecrawl_api_key)):
+            self.log_detail("[SECURITY] 検索語を安全性検査で拒否しました（詳細はセキュリティログ）")
+            return []
+        return self.search.text(query, max_results=max_results)
 
     def log_source_trace(
         self,
@@ -574,7 +603,7 @@ class ResearchWorkflowNodes:
             "source_count": source_count,
         }
         try:
-            response = client.invoke(prompt)
+            response = client.invoke([SystemMessage(content=SECURITY_INSTRUCTIONS), HumanMessage(content=prompt)])
         except Exception as error:
             metric.update({
                 "duration_ms": round((time.perf_counter() - started_at) * 1000),
@@ -630,7 +659,7 @@ class ResearchWorkflowNodes:
             try:
                 self.progress(stage, status, detail)
             except Exception as error:
-                self.log_detail(f"進行状況の通知に失敗しました: {error}")
+                self.log_detail(f"進行状況の通知に失敗しました: {type(error).__name__}")
 
     def track_node(self, stage: str, node: Callable[[State], dict[str, Any]]):
         def tracked(state: State):
@@ -738,9 +767,9 @@ class ResearchWorkflowNodes:
             for index, query in enumerate(plan.official_queries, start=1):
                 self.log_detail(f"  公式検索案 {index}: {query}")
         except Exception as err:
-            print(f"調査計画のパース失敗 (フォールバック適用): {err}")
+            print(f"調査計画のパース失敗 (フォールバック適用): {type(err).__name__}")
             plan = SearchPlan(tasks=[SearchTask(aspect="総合調査", query=query, reason="基本情報収集")])
-            self.log_detail(f"調査計画の解析に失敗したため、基本検索に切り替えました: {err}")
+            self.log_detail(f"調査計画の解析に失敗したため、基本検索に切り替えました: {type(err).__name__}")
         return plan
 
     def _validate_search_plan(self, query: str, plan: SearchPlan) -> SearchPlan:
@@ -750,12 +779,12 @@ class ResearchWorkflowNodes:
             )
         except Exception as error:
             validated_queries = []
-            self.log_detail(f"調査計画の関連度検査に失敗しました。元の質問から検索します: {error}")
+            self.log_detail(f"調査計画の関連度検査に失敗しました。元の質問から検索します: {type(error).__name__}")
         self.log_detail(
             f"関連度検査を通過した調査計画クエリ: {len(validated_queries)}/{len(plan.tasks)}件"
         )
-        for index, query in enumerate(validated_queries, start=1):
-            self.log_detail(f"  採用クエリ {index}: {query}")
+        for index, validated_query in enumerate(validated_queries, start=1):
+            self.log_detail(f"  採用クエリ {index}: {validated_query}")
         if len(validated_queries) != len(plan.tasks):
             self.log_detail(
                 f"元の質問との関連が弱い調査計画を {len(plan.tasks) - len(validated_queries)}件除外しました"
@@ -771,7 +800,7 @@ class ResearchWorkflowNodes:
                 query, official_queries, self.reranker,
             )
         except Exception as error:
-            self.log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {error}")
+            self.log_detail(f"公式検索案の関連度検査に失敗しました。基本クエリを使います: {type(error).__name__}")
             official_queries = []
         subject = _compact_query_terms(query) or query.strip()
         official_fallbacks = [
@@ -784,7 +813,7 @@ class ResearchWorkflowNodes:
         for fallback_query in official_fallbacks:
             if len(official_queries) >= 5:
                 break
-            if fallback_query.casefold() not in {query.casefold() for query in official_queries}:
+            if safe_search_query(fallback_query, query) and fallback_query.casefold() not in {query.casefold() for query in official_queries}:
                 official_queries.append(fallback_query)
         plan = SearchPlan(tasks=[
             SearchTask(
@@ -830,7 +859,7 @@ class ResearchWorkflowNodes:
         if not selected_official_queries:
             regular_limit = self.settings.max_search_queries
         sends = [
-            Send("search", {"task": task})
+            Send("search", {"task": task, "original_query": state["query"]})
             for task in state["plan"].tasks[:regular_limit]
         ]
         if selected_official_queries:
@@ -870,7 +899,7 @@ class ResearchWorkflowNodes:
             searched_queries.append(query)
             candidates: list[SearchResult] = []
             try:
-                response = self.search.text(query, max_results=self.settings.results_per_query)
+                response = self._search_text(query, max_results=self.settings.results_per_query, original_query=state.get("original_query", state.get("query", "")))
                 add_search_results(candidates, response, query)
                 self.report_progress(
                     progress_stage, "progress",
@@ -881,7 +910,7 @@ class ResearchWorkflowNodes:
                 if "no results found" in str(error).casefold():
                     self.log_detail(f"公式ソース検索結果なし: {query}")
                 else:
-                    self.log_detail(f"公式ソース検索に失敗しました: {query} / {error}")
+                    self.log_detail(f"公式ソース検索に失敗しました: {query} / {type(error).__name__}")
                 continue
             query_candidates = rerank_results(
                 candidates, self.reranker, candidate_count, weights=weights,
@@ -929,14 +958,14 @@ class ResearchWorkflowNodes:
         fresh_results: list[SearchResult] = []
         self.log_detail(f"検索開始: {task.query}（観点: {task.aspect}）")
         try:
-            response = self.search.text(task.query, max_results=self.settings.results_per_query)
+            response = self._search_text(task.query, max_results=self.settings.results_per_query, original_query=state.get("original_query", ""))
             add_search_results(fresh_results, response, task.query)
         except Exception as error:
             if "no results found" in str(error).casefold():
                 self.log_detail(f"検索結果なし: {task.query}")
             else:
-                print(f"検索失敗 ({task.query}): {error}")
-                self.log_detail(f"検索失敗: {task.query} / {error}")
+                print(f"検索失敗 ({task.query}): {type(error).__name__}")
+                self.log_detail(f"検索失敗: {task.query} / {type(error).__name__}")
             return {
                 "results": [], "evidence_results": [], "search_query_count": 1,
                 "searched_queries": [task.query], "normal_search_query_count": 1,
@@ -995,7 +1024,7 @@ class ResearchWorkflowNodes:
             data = normalize_evaluation_payload(parse_json_from_response(raw_evaluation))
             eval_obj = Evaluation.model_validate(data)
         except Exception as err:
-            self.log_detail(f"品質評価の応答を解析できませんでした: {err}")
+            self.log_detail(f"品質評価の応答を解析できませんでした: {type(err).__name__}")
             self.log_detail("判断: 応答形式を修正して品質評価を1回だけ再試行します")
             try:
                 if not raw_evaluation:
@@ -1006,7 +1035,7 @@ class ResearchWorkflowNodes:
 両方のクエリ配列の各要素は検索文そのものの文字列です。{{"query": "..."}} のようなオブジェクトを配列に入れないでください。
 
 評価案:
-{raw_evaluation}
+{untrusted_data("previous_evaluation", raw_evaluation)}
 
 JSON例:
 {{"sufficient":false,"missing_information":[],"weak_evidence":[],"reason":"評価理由","additional_queries":[],"official_additional_queries":[]}}'''
@@ -1018,8 +1047,8 @@ JSON例:
                 self.log_detail("品質評価の再試行に成功しました")
             except Exception as retry_error:
                 evaluation_failed = True
-                print(f"品質評価の再試行にも失敗しました: {retry_error}")
-                self.log_detail(f"品質評価の再試行にも失敗しました: {retry_error}")
+                print(f"品質評価の再試行にも失敗しました: {type(retry_error).__name__}")
+                self.log_detail(f"品質評価の再試行にも失敗しました: {type(retry_error).__name__}")
                 fallback_queries = []
                 if (
                     state.get("search_round", 0) == 0
@@ -1036,7 +1065,7 @@ JSON例:
                     sufficient=False,
                     missing_information=["品質評価の応答を解析できず、情報の十分性を確認できませんでした。"],
                     weak_evidence=[],
-                    reason=f"品質評価の応答を解析できませんでした: {retry_error}",
+                    reason=f"品質評価の応答を解析できませんでした: {type(retry_error).__name__}",
                     additional_queries=fallback_queries,
                     official_additional_queries=[],
                 )
@@ -1093,14 +1122,14 @@ JSON例:
             )
         except Exception as error:
             eval_obj.additional_queries = []
-            self.log_detail(f"追加検索案の関連度検査に失敗したため、モデル生成クエリを破棄しました: {error}")
+            self.log_detail(f"追加検索案の関連度検査に失敗したため、モデル生成クエリを破棄しました: {type(error).__name__}")
         try:
             eval_obj.official_additional_queries = _validate_followup_queries(
                 state["query"], proposed_official_queries, self.reranker,
             )
         except Exception as error:
             eval_obj.official_additional_queries = []
-            self.log_detail(f"公式レーンの追加案の関連度検査に失敗したため、クエリを破棄しました: {error}")
+            self.log_detail(f"公式レーンの追加案の関連度検査に失敗したため、クエリを破棄しました: {type(error).__name__}")
         rejected_count = len(proposed_queries) - len(eval_obj.additional_queries)
         if rejected_count:
             self.log_detail(
@@ -1180,9 +1209,9 @@ Page-level source assessment:
 - A registered official or trusted domain is a ranking signal, not automatic evidence acceptance.
 - Return concise reasons and a short `support_scope`; do not invent facts.
 URLs requiring assessment:
-{assessment_targets_text}
+{untrusted_data("assessment_targets", assessment_targets_text)}
 Previously cached page assessments (reuse unless the current evidence contradicts them):
-{cached_assessments_text}
+{untrusted_data("cached_assessments", cached_assessments_text)}
 """
         prompt = f"""You are a web-research quality evaluator (リサーチ品質評価担当). Return exactly one valid JSON object, with no prose or reasoning tags.
 Date: {self.current_date}
@@ -1349,9 +1378,9 @@ Return this JSON schema (keep strings concise):
 Keep only source-linked confirmed facts, unresolved questions, URL-level source decisions, and the next action. A confirmed fact must use a URL from Selected sources; do not invent URLs or facts. Do not include reasoning or prose outside JSON. Keep each list to at most 3 entries and the entire JSON concise.
 
 User request: {state['query'][:600]}
-Previous compact memo: {current_memo or '{}'}
-New quality evaluation: {json.dumps(evaluation_summary, ensure_ascii=False)}
-Selected sources: {json.dumps(source_items, ensure_ascii=False)}
+Previous compact memo: {untrusted_data("previous_memo", current_memo or "{}")}
+New quality evaluation: {untrusted_data("quality_evaluation", evaluation_summary)}
+Selected sources: {untrusted_data("selected_sources", source_items)}
 
 Return exactly this JSON schema:
 {{"request":"","confirmed":[{{"source_url":"","note":""}}],"unresolved":[""],"source_decisions":[{{"url":"","decision":"","reason":""}}],"next_action":""}}"""
@@ -1466,6 +1495,7 @@ Return exactly this JSON schema:
         if normal:
             sends.append(Send("additional_search", {
                 "queries": normal,
+                "original_query": state.get("query", ""),
                 "existing_urls": [item.url for item in
                     state.get("results", []) + state.get("evidence_results", [])
                     + state.get("official_results", []) if item.url],
@@ -1474,6 +1504,7 @@ Return exactly this JSON schema:
         if official:
             sends.append(Send("official_additional_search", {
                 "official_queries": official,
+                "original_query": state.get("query", ""),
                 "progress_stage": "official_additional_search",
             }))
         if not sends:
@@ -1497,16 +1528,9 @@ Return exactly this JSON schema:
             self.log_detail(f"追加検索開始: {query}")
             query_fresh: list[SearchResult] = []
             try:
-                response = self.search.text(query, max_results=self.settings.results_per_query)
-                for item in response:
-                    url = item.get("href", "")
-                    if not url or url in existing_urls:
-                        continue
-                    query_fresh.append(SearchResult(
-                        query=query, title=item.get("title", ""), url=url,
-                        snippet=item.get("body", ""),
-                    ))
-                    existing_urls.add(url)
+                response = self._search_text(query, max_results=self.settings.results_per_query, original_query=state.get("original_query", state.get("query", "")))
+                add_search_results(query_fresh, [item for item in response if item.get("href") not in existing_urls], query)
+                existing_urls.update(item.url for item in query_fresh)
                 self.log_detail(
                     f"追加検索候補: {len(query_fresh)}件（既出URLを除外、取得上限: {self.settings.results_per_query}）"
                 )
@@ -1550,8 +1574,8 @@ Return exactly this JSON schema:
                 if "no results found" in str(error).casefold():
                     self.log_detail(f"追加検索結果なし: {query}")
                 else:
-                    print(f"追加検索失敗 ({query}): {error}")
-                    self.log_detail(f"追加検索失敗: {query} / {error}")
+                    print(f"追加検索失敗 ({query}): {type(error).__name__}")
+                    self.log_detail(f"追加検索失敗: {query} / {type(error).__name__}")
         return {
             "results": delta_results,
             "evidence_results": delta_evidence_results,
@@ -1615,8 +1639,8 @@ Return exactly this JSON schema:
 
 調査品質の注意:
 この調査は十分性を確認できていません。
-評価理由: {evaluation.reason}
-未確認事項: {", ".join(evaluation.missing_information) or "なし"}
+評価理由: {untrusted_data("evaluation_reason", evaluation.reason)}
+未確認事項: {untrusted_data("missing_information", evaluation.missing_information)}
 レポートでは冒頭に調査が不完全であることを明記し、根拠から確認できる範囲と未確認事項を区別してください。"""
         final_urls = {item.url for item in unique_results if item.url}
         brief_context = research_brief_context(state.get("run_memo", ""), final_urls)
@@ -1625,7 +1649,7 @@ Return exactly this JSON schema:
 質問: {state['query']}
 
 この調査回だけの共有ボード（過去の投稿を含む索引用。事実の根拠として引用せず、必ず下の取得済みソースで確認すること）:
-{brief_context or "none"}
+{untrusted_data("research_memo", brief_context or "none")}
 
 収集された情報源:
 {formatted_evidence}
@@ -1664,7 +1688,7 @@ Return exactly this JSON schema:
 取得済みの根拠:
 {formatted_evidence}
 元の回答:
-{answer}
+{untrusted_data("previous_answer", answer)}
 
 本文中のURLは書かず、事実を含む段落には有効な出典番号を付けてください。
 根拠がない主張は削除するか、確認できないと明示してください。
@@ -1677,7 +1701,7 @@ Return exactly this JSON schema:
                     llm=self.answer_llm, source_count=len(unique_results),
                 ).content)
             except EmptyModelResponseError as error:
-                self.log_detail(f"Citation retry produced no content; keeping the first answer: {error}")
+                self.log_detail(f"Citation retry produced no content; keeping the first answer: {type(error).__name__}")
         else:
             self.log_detail("出典検証: 出典番号の形式と範囲を確認しました（主張の裏付けは未検証）")
         return answer
@@ -1702,7 +1726,7 @@ Return exactly this JSON schema:
                 "final_answer", answer_prompt, llm=self.answer_llm, source_count=len(unique_results),
             ).content)
         except EmptyModelResponseError as error:
-            self.log_detail(f"Final answer generation produced no content: {error}")
+            self.log_detail(f"Final answer generation produced no content: {type(error).__name__}")
             return {"summary": (
                 "調査結果を生成できませんでした。LM Studioでこのモデルの思考モードを無効化するか、"
                 "役割別の出力上限を増やしてから再実行してください。"

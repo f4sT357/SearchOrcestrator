@@ -66,7 +66,7 @@ def test_final_answer_excludes_page_rejected_by_assessment() -> None:
         "official_results": [], "evaluation": evaluation, "run_memo": "",
     })
 
-    prompt = llm.invoke.call_args.args[0]
+    prompt = llm.invoke.call_args.args[0][-1].content
     assert "approved evidence" in prompt
     assert "unsupported claim" not in prompt
     assert "https://example.com/accepted" in result["summary"]

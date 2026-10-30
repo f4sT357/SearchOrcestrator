@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import sys
 import os
 from typing import Any
@@ -139,6 +141,15 @@ def _fetch_settings_summary(settings: Settings) -> str:
     return summary
 
 
+class _SecurityLogRelay(logging.Handler):
+    def __init__(self, emit_message):
+        super().__init__()
+        self.emit_message = emit_message
+
+    def emit(self, record):
+        self.emit_message(record.getMessage())
+
+
 class ResearchWorker(QThread):
     """Executes the search orchestrator workflow asynchronously."""
 
@@ -162,6 +173,9 @@ class ResearchWorker(QThread):
         self.max_concurrency = max_concurrency
 
     def run(self) -> None:
+        security_logger = logging.getLogger("search_orchestrator.security")
+        security_handler = _SecurityLogRelay(self.log_signal.emit)
+        security_logger.addHandler(security_handler)
         try:
             fetch_settings = _fetch_settings_summary(self.settings)
             self.log_signal.emit(
@@ -205,4 +219,6 @@ class ResearchWorker(QThread):
             self.log_signal.emit(f"エラーが発生しました: {exc}")
             self.error_signal.emit(str(exc))
         finally:
+            security_logger.removeHandler(security_handler)
+            security_handler.close()
             self.finished_signal.emit()

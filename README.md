@@ -25,6 +25,8 @@
 
 ## セットアップ
 
+2026-10-30のセキュリティ修正内容・検証範囲・制約は [セキュリティレビュー](SECURITY_REVIEW_JA.md) を参照してください。標準HTTP取得を既定とし、Firecrawl／Jinaはサービス側の通信制限を別途構成した環境に限り利用できます。
+
 Python 3.11 から 3.13 を用意してから、次を実行します。
 
 ```powershell
@@ -78,10 +80,12 @@ python main.py --results-per-query 8 --content-candidate-results-per-query 5 --r
 python main.py --content-fetcher firecrawl --firecrawl-url "http://localhost:3002" "調査テーマ"
 ```
 
-本文取得に失敗した場合、Jina Reader へ URL を送信して再取得する機能は既定で無効です。利用する場合は GUI の「Webアクセス」設定、または CLI の `--jina-fallback` で明示的に有効化できます。
+本文取得に失敗した場合、Jina Reader へ URL を送信して再取得する機能は既定で無効です。外部取得サービスの通信制限を構成・確認し、`config.local.json` に `"remote_fetchers_network_isolated": true` を設定した環境でのみ、GUI または CLI の `--jina-fallback` から有効化できます。一般のJinaサービスの隔離は本レビューでは未確認です。
 
 内蔵の本文取得では、同一URLを実行内・実行間で再利用します。既定では `.cache/web-content` にURLをSHA-256でハッシュ化したキャッシュを保存し、6時間以内は通信せず再利用します。期限後は `ETag` / `Last-Modified` があれば条件付きGETで再検証し、`304 Not Modified` では本文を再利用します。`Cache-Control: no-store` は保存せず、サーバー指定の `max-age` を尊重します。ホストごとの取得は1件ずつにし、`429` の `Retry-After` は最大30秒待機して1回だけ再試行します。`config.json` または `config.local.json` では `web_cache_enabled`、`web_cache_ttl_seconds`、`web_cache_dir`、`web_host_min_interval_seconds`、`web_max_retry_after_seconds` を変更できます。
 ### Firecrawl セルフホストを本文取得に使う
+
+先にサービス側の公開IPへの通信制限を構成し、`config.local.json` の `remote_fetchers_network_isolated` を `true` にしてください。これは実際の隔離を構成する設定ではありません。同梱起動スクリプトやlocalhostへのAPI公開だけでは、この要件を満たしません。詳細は [利用条件](SECURITY_REVIEW_JA.md#firecrawljinaの利用条件) を参照してください。
 
 Firecrawl は同梱の `firecrawl-start.bat` を実行すると起動できます。初回は公式リポジトリの固定バージョンを取得し、必要な `.env` を作って Docker Compose で起動します。停止は `firecrawl-stop.bat` です。どちらもプロジェクトのルートで実行してください。Docker Desktop が停止中なら起動を試みます。
 

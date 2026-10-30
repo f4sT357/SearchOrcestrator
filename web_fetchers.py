@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
+import math
 import re
 import time
+import zlib
 from enum import Enum
 from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import lxml.html
+
+from security import PublicHTTPTransport, UnsafeDestinationError, is_safe_url, resolve_public_addresses, security_event
 
 
 class FetchStatus(str, Enum):
@@ -34,6 +37,7 @@ class FetchStatus(str, Enum):
     PARSE_ERROR = "parse_error"
     EMPTY = "empty"
     FAILED = "failed"
+    BLOCKED = "blocked"
 
 
 class FetchError(Exception):
@@ -51,34 +55,56 @@ class WebContentFetcher(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def is_safe_url(url: str) -> bool:
-    """Validate that the given URL uses http/https and is not pointing to private/loopback/metadata addresses."""
-    if not url or not isinstance(url, str):
-        return False
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_REDIRECTS = 5
+
+
+def bounded_request(client, method, url, *, timeout, deadline, headers=None, json_body=None,
+                    content_types=("text/html", "application/xhtml+xml", "text/plain")):
+    """Stream one hop with a wire/decompressed budget and no automatic redirects."""
+    remaining = min(timeout, deadline - time.monotonic())
+    if remaining <= 0:
+        raise httpx.ReadTimeout("Web fetch deadline exceeded")
+    request = client.build_request(method, url, headers=headers, json=json_body, timeout=remaining)
+    response = client.send(request, stream=True, follow_redirects=False)
     try:
-        parsed = urlparse(url.strip())
-        if parsed.scheme.lower() not in {"http", "https"}:
-            return False
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-
-        lower_host = hostname.lower()
-        if lower_host in {"localhost", "metadata.google.internal"} or lower_host.endswith(".local") or lower_host.endswith(".internal"):
-            return False
-
-        try:
-            ip = ipaddress.ip_address(lower_host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-                return False
-            if str(ip) in {"169.254.169.254", "0.0.0.0"}:
-                return False
-        except ValueError:
-            pass
-
-        return True
-    except Exception:
-        return False
+        if response.status_code in {301, 302, 303, 307, 308, 304} or response.status_code >= 400:
+            return httpx.Response(response.status_code, headers=response.headers, request=request)
+        mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if mime not in content_types:
+            raise FetchError("Unsupported web content type", status=FetchStatus.BLOCKED)
+        length = response.headers.get("content-length")
+        if length and (not length.isdecimal() or int(length) > MAX_RESPONSE_BYTES):
+            raise FetchError("Web response exceeds size limit", status=FetchStatus.BLOCKED)
+        encoding = response.headers.get("content-encoding", "identity").lower()
+        decoder = None
+        if not response.is_stream_consumed:
+            if encoding in {"gzip", "deflate"}:
+                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS)
+            elif encoding not in {"", "identity"}:
+                raise FetchError("Unsupported content encoding", status=FetchStatus.BLOCKED)
+        parts = []
+        wire_size = size = 0
+        chunks = [response.content] if response.is_stream_consumed else response.iter_raw()
+        for chunk in chunks:
+            if time.monotonic() >= deadline:
+                raise httpx.ReadTimeout("Web fetch deadline exceeded")
+            wire_size += len(chunk)
+            if wire_size > MAX_RESPONSE_BYTES:
+                raise FetchError("Web response exceeds size limit", status=FetchStatus.BLOCKED)
+            decoded = decoder.decompress(chunk, MAX_RESPONSE_BYTES - size + 1) if decoder else chunk
+            size += len(decoded)
+            if size > MAX_RESPONSE_BYTES or (decoder and decoder.unconsumed_tail):
+                raise FetchError("Decompressed web response exceeds size limit", status=FetchStatus.BLOCKED)
+            parts.append(decoded)
+        if decoder and not decoder.eof:
+            raise FetchError("Incomplete compressed response", status=FetchStatus.FAILED)
+        result_headers = dict(response.headers)
+        result_headers.pop("content-encoding", None)
+        result_headers.pop("content-length", None)
+        return httpx.Response(response.status_code, headers=result_headers, content=b"".join(parts), request=request)
+    finally:
+        response.close()
 
 class DefaultWebContentFetcher:
     """Fetch and extract clean, readable text from a URL using httpx and lxml."""
@@ -101,6 +127,7 @@ class DefaultWebContentFetcher:
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Accept-Encoding": "identity",
         }
         self._client = client
         self._owns_client = client is None
@@ -115,11 +142,8 @@ class DefaultWebContentFetcher:
 
     def _get_client(self, timeout: float = 8.0) -> Any:
         if self._client is None or getattr(self._client, "is_closed", False):
-            created = httpx.Client(headers=self.headers, follow_redirects=True, timeout=timeout)
-            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
-                entered = created.__enter__.return_value
-                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
-                    return entered
+            created = httpx.Client(headers=self.headers, follow_redirects=False, timeout=timeout,
+                                   trust_env=False, transport=PublicHTTPTransport())
             self._client = created
             self._owns_client = True
         return self._client
@@ -145,7 +169,7 @@ class DefaultWebContentFetcher:
         try:
             # Strip XML declaration if present to prevent lxml ValueError on Unicode strings
             content_to_parse = re.sub(r"^\s*<\?xml[^>]*\?>", "", html_content, flags=re.IGNORECASE)
-            tree = lxml.html.fromstring(content_to_parse)
+            tree = lxml.html.fromstring(content_to_parse, parser=lxml.html.HTMLParser(no_network=True))
             date_metadata: list[str] = []
             for meta in tree.xpath("//meta[@content]"):
                 name = " ".join(filter(None, (
@@ -205,10 +229,17 @@ class DefaultWebContentFetcher:
             return None
         with self._cache_lock:
             try:
+                if path.stat().st_size > MAX_RESPONSE_BYTES:
+                    return None
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return None
         if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
+            return None
+        if payload.get("version") != 2 or not isinstance(payload.get("content_length_limit"), int):
+            return None
+        fresh_until = payload.get("fresh_until")
+        if not isinstance(fresh_until, (int, float)) or not math.isfinite(fresh_until):
             return None
         return payload
 
@@ -265,14 +296,32 @@ class DefaultWebContentFetcher:
         with self._host_locks_lock:
             return host, self._host_locks.setdefault(host, Lock())
 
-    def _get(self, client: Any, url: str, headers: dict[str, str]) -> Any:
+    def _get(self, client: Any, url: str, headers: dict[str, str], *, timeout: float, deadline: float) -> Any:
+        for hop in range(MAX_REDIRECTS + 1):
+            if not is_safe_url(url):
+                security_event("blocked_redirect_url", url)
+                raise FetchError("Blocked web destination", status=FetchStatus.BLOCKED)
+            response = self._get_one(client, url, headers, timeout=timeout, deadline=deadline)
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response
+            location = response.headers.get("location")
+            if not location or hop == MAX_REDIRECTS:
+                raise FetchError("Redirect limit or invalid redirect", status=FetchStatus.BLOCKED)
+            target = urljoin(url, location)
+            # Do not forward conditional headers to another origin.
+            if urlparse(target).netloc != urlparse(url).netloc:
+                headers = {}
+            url = target
+        raise FetchError("Redirect limit exceeded", status=FetchStatus.BLOCKED)
+
+    def _get_one(self, client: Any, url: str, headers: dict[str, str], *, timeout: float, deadline: float) -> Any:
         host, host_lock = self._host_lock(url)
         with host_lock:
             elapsed = time.monotonic() - self._host_last_request.get(host, 0.0)
             if elapsed < self.min_host_interval_seconds:
                 time.sleep(self.min_host_interval_seconds - elapsed)
             self._host_last_request[host] = time.monotonic()
-            return client.get(url, headers=headers) if headers else client.get(url)
+            return bounded_request(client, "GET", url, headers=headers, timeout=timeout, deadline=deadline)
 
     def _retry_after_seconds(self, headers: Any) -> float:
         try:
@@ -305,7 +354,11 @@ class DefaultWebContentFetcher:
 
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
         if not is_safe_url(url):
+            security_event("blocked_fetch_url", url)
             return ""
+        if not math.isfinite(timeout) or timeout <= 0 or max_length < 1:
+            raise ValueError("Invalid fetch limits")
+        deadline = time.monotonic() + timeout
         cached = self._load_cached_page(url)
         cache_has_requested_length = bool(
             cached and cached.get("content_length_limit", 0) >= max_length
@@ -317,12 +370,14 @@ class DefaultWebContentFetcher:
             # A response cached with a smaller extraction limit cannot satisfy a
             # larger request, even if the origin would otherwise return 304.
             headers = self._cache_headers(cached) if cache_has_requested_length else {}
-            resp = self._get(client, url, headers)
+            resp = self._get(client, url, headers, timeout=timeout, deadline=deadline)
             if resp.status_code == 429:
                 delay = self._retry_after_seconds(resp.headers)
                 if delay:
+                    if time.monotonic() + delay >= deadline:
+                        raise httpx.ReadTimeout("Retry exceeds fetch deadline")
                     time.sleep(delay)
-                    resp = self._get(client, url, headers)
+                    resp = self._get(client, url, headers, timeout=timeout, deadline=deadline)
             if resp.status_code == 304 and cached:
                 lifetime = self._cache_lifetime(resp.headers)
                 if lifetime is not None:
@@ -340,6 +395,7 @@ class DefaultWebContentFetcher:
             lifetime = self._cache_lifetime(resp.headers)
             if content and lifetime is not None:
                 self._store_cached_page(url, {
+                    "version": 2,
                     "content": content,
                     "stored_at": time.time(),
                     "fresh_until": time.time() + lifetime,
@@ -350,6 +406,9 @@ class DefaultWebContentFetcher:
             elif lifetime is None:
                 self._delete_cached_page(url)
             return content
+        except FetchError as error:
+            security_event("fetch_rejected", url, status=(error.status or FetchStatus.FAILED).value)
+            raise
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
             mapping = {
@@ -362,18 +421,23 @@ class DefaultWebContentFetcher:
                 503: FetchStatus.HTTP_503,
                 504: FetchStatus.HTTP_504,
             }
-            raise FetchError(f"HTTP error {status_code} for {url}", status=mapping.get(status_code, FetchStatus.FAILED)) from http_err
+            raise FetchError(f"HTTP error {status_code}", status=mapping.get(status_code, FetchStatus.FAILED)) from http_err
         except httpx.TimeoutException as timeout_err:
-            raise FetchError(f"Timeout fetching {url}", status=FetchStatus.TIMEOUT) from timeout_err
+            raise FetchError("Web fetch timed out", status=FetchStatus.TIMEOUT) from timeout_err
+        except UnsafeDestinationError as net_err:
+            security_event("blocked_connection_destination", url)
+            raise FetchError("Blocked connection destination", status=FetchStatus.BLOCKED) from net_err
         except httpx.NetworkError as net_err:
-            raise FetchError(f"Network error fetching {url}", status=FetchStatus.CONNECTION_ERROR) from net_err
+            security_event("web_connection_rejected_or_failed", url)
+            raise FetchError("Web connection failed", status=FetchStatus.CONNECTION_ERROR) from net_err
         except Exception as err:
-            raise FetchError(f"Web page fetch failed ({url}): {err}", status=FetchStatus.FAILED) from err
+            raise FetchError("Web page fetch failed", status=FetchStatus.FAILED) from err
 
 class FirecrawlFetcher:
     """Retrieve one page as Markdown from a self-hosted Firecrawl API."""
 
-    def __init__(self, api_url: str = "http://localhost:3002", api_key: str = "", client: httpx.Client | None = None) -> None:
+    def __init__(self, api_url: str = "http://localhost:3002", api_key: str = "", client: httpx.Client | None = None, *, network_isolated: bool = False) -> None:
+        self.network_isolated = network_isolated
         base_url = api_url.rstrip("/")
         parsed_url = urlparse(base_url)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
@@ -394,11 +458,7 @@ class FirecrawlFetcher:
 
     def _get_client(self, timeout: float = 30.0) -> Any:
         if self._client is None or getattr(self._client, "is_closed", False):
-            created = httpx.Client(headers=self.headers, timeout=max(timeout, 30.0))
-            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
-                entered = created.__enter__.return_value
-                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
-                    return entered
+            created = httpx.Client(headers=self.headers, timeout=max(timeout, 30.0), trust_env=False, follow_redirects=False)
             self._client = created
             self._owns_client = True
         return self._client
@@ -416,19 +476,24 @@ class FirecrawlFetcher:
     def fetch(self, url: str, *, timeout: float = 8.0, max_length: int = 3000) -> str:
         if not is_safe_url(url):
             return ""
+        if self.network_isolated is not True:
+            security_event("remote_fetcher_requires_network_isolation", url)
+            raise FetchError("Firecrawl requires enforced public-only service egress", status=FetchStatus.BLOCKED)
+        resolve_public_addresses(urlparse(url).hostname, urlparse(url).port or 443)
         try:
             # Firecrawl's scrape operation may need longer than the built-in
             # fetcher's interactive timeout, especially when rendering pages.
             client = self._get_client(timeout=timeout)
-            response = client.post(
-                self.endpoint,
-                json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            response = bounded_request(
+                client, "POST", self.endpoint, timeout=max(timeout, 30.0),
+                deadline=time.monotonic() + max(timeout, 30.0),
+                content_types=("application/json",), json_body={"url": url, "formats": ["markdown"], "onlyMainContent": True},
             )
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("success") is False:
                 raise FetchError(
-                    f"Firecrawl scrape failed for {url}: {payload.get('error', 'invalid response') if isinstance(payload, dict) else 'invalid response'}",
+                    "Firecrawl returned an unsuccessful response",
                     status=FetchStatus.PARSE_ERROR,
                 )
             data = payload.get("data") or {}
@@ -460,7 +525,7 @@ class FirecrawlFetcher:
         except httpx.NetworkError as net_err:
             raise FetchError("Firecrawl connection failed", status=FetchStatus.CONNECTION_ERROR) from net_err
         except Exception as err:
-            raise FetchError(f"Firecrawl request failed: {err}", status=FetchStatus.FAILED) from err
+            raise FetchError("Firecrawl request failed", status=FetchStatus.FAILED) from err
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +535,8 @@ class FirecrawlFetcher:
 class JinaReaderFetcher:
     """Fallback fetcher using Jina Reader API to retrieve page content as markdown/json."""
 
-    def __init__(self, api_url: str = "https://r.jina.ai/", client: httpx.Client | None = None) -> None:
+    def __init__(self, api_url: str = "https://r.jina.ai/", client: httpx.Client | None = None, *, network_isolated: bool = False) -> None:
+        self.network_isolated = network_isolated
         # Ensure no trailing slash for consistent URL building
         self.api_url = api_url.rstrip("/")
         self.headers = {"Accept": "application/json"}
@@ -479,11 +545,7 @@ class JinaReaderFetcher:
 
     def _get_client(self, timeout: float = 8.0) -> Any:
         if self._client is None or getattr(self._client, "is_closed", False):
-            created = httpx.Client(headers=self.headers, timeout=timeout)
-            if hasattr(created, "__enter__") and hasattr(created, "_mock_return_value"):
-                entered = created.__enter__.return_value
-                if entered is not created and (hasattr(entered, "get") or hasattr(entered, "post")):
-                    return entered
+            created = httpx.Client(headers=self.headers, timeout=timeout, trust_env=False, follow_redirects=False, transport=PublicHTTPTransport())
             self._client = created
             self._owns_client = True
         return self._client
@@ -512,16 +574,23 @@ class JinaReaderFetcher:
         """
         if not is_safe_url(url):
             return ""
+        if self.network_isolated is not True:
+            security_event("remote_fetcher_requires_network_isolation", url)
+            raise FetchError("Jina requires enforced public-only service egress", status=FetchStatus.BLOCKED)
+        resolve_public_addresses(urlparse(url).hostname, urlparse(url).port or 443)
         try:
             # Jina API format: https://r.jina.ai/http://example.com
             full_url = f"{self.api_url}/{url}"
             client = self._get_client(timeout=timeout)
-            resp = client.get(full_url)
+            resp = bounded_request(client, "GET", full_url, timeout=timeout,
+                                   deadline=time.monotonic() + timeout, content_types=("application/json",))
             resp.raise_for_status()
             data = resp.json()
             # Jina returns a JSON with a "content" field containing markdown/text
             content = data.get("content") or data.get("text") or ""
             return content[:max_length]
+        except FetchError:
+            raise
         except httpx.HTTPStatusError as http_err:
             status_code = http_err.response.status_code
             mapping = {
@@ -534,8 +603,8 @@ class JinaReaderFetcher:
                 504: FetchStatus.HTTP_504,
             }
             fetch_status = mapping.get(status_code, FetchStatus.FAILED)
-            raise FetchError(f"JinaReader HTTP error {status_code} for {url}", status=fetch_status) from http_err
+            raise FetchError(f"JinaReader HTTP error {status_code}", status=fetch_status) from http_err
         except httpx.TimeoutException as timeout_err:
-            raise FetchError(f"JinaReader timeout fetching {url}", status=FetchStatus.TIMEOUT) from timeout_err
+            raise FetchError("JinaReader timeout", status=FetchStatus.TIMEOUT) from timeout_err
         except Exception as err:
-            raise FetchError(f"JinaReader fetch failed for {url}: {err}", status=FetchStatus.FAILED) from err
+            raise FetchError("JinaReader fetch failed", status=FetchStatus.FAILED) from err

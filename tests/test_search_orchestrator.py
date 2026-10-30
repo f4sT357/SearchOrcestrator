@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+from urllib.parse import quote
 from datetime import date
 import json
 import pytest
@@ -54,8 +55,8 @@ def test_final_answer_uses_evaluation_evidence_candidates() -> None:
                             snippet="important evidence", relevance_score=0.8, combined_score=0.8)
     result = nodes.analyze({"query": "q", "results": [], "evidence_results": [evidence],
                             "official_results": [], "evaluation": None, "run_memo": "private memo"})
-    assert "important evidence" in llm.invoke.call_args.args[0]
-    assert "private memo" not in llm.invoke.call_args.args[0]
+    assert "important evidence" in llm.invoke.call_args.args[0][-1].content
+    assert "private memo" not in llm.invoke.call_args.args[0][-1].content
     assert "https://example.com/evidence" in result["summary"]
 
 
@@ -88,7 +89,7 @@ def test_final_answer_receives_only_source_linked_research_brief() -> None:
         "official_results": [], "evaluation": None, "run_memo": memo,
     })
 
-    prompt = llm.invoke.call_args.args[0]
+    prompt = llm.invoke.call_args.args[0][-1].content
     assert "Verified release detail" in prompt
     assert "Confirm the release date" in prompt
     assert "Invented detail" not in prompt
@@ -184,7 +185,7 @@ def test_settings_load_config_then_environment_overrides(tmp_path, monkeypatch) 
         "fetch_web_content": False,
         "use_fallback_fetcher": True,
         "max_content_length": 4500,
-        "content_fetcher": "firecrawl",
+        "content_fetcher": "firecrawl", "remote_fetchers_network_isolated": True,
         "firecrawl_api_url": "http://firecrawl.local:3002",
         "firecrawl_api_key": "must-not-load-from-file",
     }), encoding="utf-8")
@@ -253,7 +254,7 @@ def test_workflow_uses_configured_firecrawl_fetcher(monkeypatch) -> None:
     from unittest.mock import patch
 
     settings = Settings(
-        content_fetcher="firecrawl",
+        content_fetcher="firecrawl", remote_fetchers_network_isolated=True,
         firecrawl_api_url="http://localhost:3300",
         firecrawl_api_key="test-key",
     )
@@ -267,6 +268,7 @@ def test_workflow_uses_configured_firecrawl_fetcher(monkeypatch) -> None:
     fetcher_class.assert_called_once_with(
         api_url="http://localhost:3300",
         api_key="test-key",
+        network_isolated=True,
     )
 
 
@@ -402,7 +404,7 @@ def test_format_results_for_llm_includes_content() -> None:
     assert "【タイトル】: A [関連度スコア: 0.950]" in formatted
     assert "【URL】: https://example.com/a" in formatted
     assert "【概要/スニペット】: snip" in formatted
-    assert "【Webページ本文抜粋】:\nDetailed body content here" in formatted
+    assert "【Webページ本文抜粋】:\\nDetailed body content here" in formatted
     assert "出典番号 [S1]" in formatted
 
 
@@ -441,8 +443,8 @@ def test_workflow_end_to_end_with_mocks() -> None:
     class MockSearch:
         def text(self, query: str, *, max_results: int):
             return [
-                {"href": f"https://example.com/{query}/1", "title": f"{query} 1", "body": "Body 1"},
-                {"href": f"https://example.com/{query}/2", "title": f"{query} 2", "body": "Body 2"},
+                {"href": f"https://example.com/{quote(query)}/1", "title": f"{query} 1", "body": "Body 1"},
+                {"href": f"https://example.com/{quote(query)}/2", "title": f"{query} 2", "body": "Body 2"},
             ]
 
     class MockReranker:
@@ -457,7 +459,8 @@ def test_workflow_end_to_end_with_mocks() -> None:
     mock_llm = MagicMock()
     mock_llm.bind.return_value = mock_llm
 
-    def llm_invoke_side_effect(prompt: str):
+    def llm_invoke_side_effect(prompt):
+        prompt = prompt[-1].content
         if "リサーチプランナー" in prompt:
             return MagicMock(content='''```json
 {
@@ -516,7 +519,7 @@ def test_workflow_end_to_end_with_mocks() -> None:
     assert result["evaluation"] is not None
     assert result["evaluation"].sufficient is True
     current_date = date.today().isoformat()
-    prompts = [call.args[0] for call in mock_llm.invoke.call_args_list]
+    prompts = [call.args[0][-1].content for call in mock_llm.invoke.call_args_list]
     assert len(prompts) >= 3
     assert sum(current_date in prompt for prompt in prompts) >= 3
     evaluation_prompt = next(prompt for prompt in prompts if "リサーチ品質評価担当" in prompt)
@@ -570,7 +573,8 @@ def test_page_date_can_promote_a_candidate_before_final_selection() -> None:
     mock_llm = MagicMock()
     mock_llm.bind.return_value = mock_llm
 
-    def invoke(prompt: str):
+    def invoke(prompt):
+        prompt = prompt[-1].content
         if "リサーチプランナー" in prompt:
             return MagicMock(content='{"tasks": [{"aspect": "A", "query": "q", "reason": "r"}]}')
         if "リサーチ品質評価担当" in prompt:
@@ -619,7 +623,8 @@ def test_invalid_evaluation_response_is_not_treated_as_sufficient() -> None:
     mock_llm = MagicMock()
     mock_llm.bind.return_value = mock_llm
 
-    def invoke(prompt: str):
+    def invoke(prompt):
+        prompt = prompt[-1].content
         if "リサーチプランナー" in prompt:
             return MagicMock(content='{"tasks": [{"aspect": "A", "query": "q", "reason": "r"}]}')
         if "リサーチ品質評価担当" in prompt:
@@ -895,7 +900,7 @@ def test_memo_keeper_updates_bounded_json_without_main_prompt_leakage() -> None:
     assert memo["confirmed"] == [{"source_url": source.url, "note": "Confirmed fact"}]
     assert memo["source_decisions"][0]["url"] == source.url
     assert len(result["run_memo"]) <= 600
-    memo_prompt = llm.bind.return_value.invoke.call_args.args[0]
+    memo_prompt = llm.bind.return_value.invoke.call_args.args[0][-1].content
     assert "private old memo" in memo_prompt
     assert nodes.llm.invoke.call_count == 0
 
@@ -930,4 +935,5 @@ def test_final_answer_prompt_keeps_all_selected_source_urls() -> None:
         "official_results": [], "evaluation": None, "run_memo": "",
     })
 
-    prompt = llm.invoke.call_args.args[0]
+    prompt = llm.invoke.call_args.args[0][-1].content
+    assert all(source.url in prompt for source in sources)

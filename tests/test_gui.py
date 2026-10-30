@@ -72,7 +72,7 @@ def test_worker_logs_selected_fetcher_without_logging_api_key(monkeypatch) -> No
 
     monkeypatch.setattr("gui.worker.create_workflow", lambda *args, **kwargs: FakeWorkflow())
     settings = Settings(
-        content_fetcher="firecrawl",
+        content_fetcher="firecrawl", remote_fetchers_network_isolated=True,
         firecrawl_api_url="http://localhost:3002",
         firecrawl_api_key="do-not-log-this-key",
     )

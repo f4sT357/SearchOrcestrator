@@ -121,6 +121,10 @@ def main(argv: list[str] | None = None) -> None:
         official_domains=settings.official_domains,
         trusted_domains=settings.trusted_domains,
     )
+    if (settings.fetch_web_content
+            and (settings.content_fetcher == "firecrawl" or settings.use_fallback_fetcher)
+            and settings.remote_fetchers_network_isolated is not True):
+        parser.error("Firecrawl/Jinaはサービス側の通信制限が必要です。--content-fetcher builtin --no-jina-fallback を使うか、隔離済みの環境でremote_fetchers_network_isolatedを設定してください。")
     if not settings.model.strip():
         parser.error(
             "LLM\u30e2\u30c7\u30eb\u540d\u304c\u672a\u8a2d\u5b9a\u3067\u3059\u3002--model\u3001SEARCH_MODEL\u3001\u307e\u305f\u306fconfig.local.json\u3067\u6307\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044"

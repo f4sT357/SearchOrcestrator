@@ -44,204 +44,67 @@ def _mock_httpx_response(status_code: int = 200, text: str = "<html><body>hello<
 
 class TestDefaultWebContentFetcher:
     def test_fetch_success(self):
-        fetcher = DefaultWebContentFetcher()
-        resp = _mock_httpx_response(200, "<html><body><p>Hello World</p></body></html>")
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value = resp
-            result = fetcher.fetch("http://example.com")
-        assert "Hello World" in result
+        with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, text="<html><body>Hello World</body></html>", headers={"content-type": "text/html"}
+        ))) as client:
+            assert DefaultWebContentFetcher(client=client).fetch("https://example.com") == "Hello World"
 
-    def test_fetch_empty_url(self):
-        fetcher = DefaultWebContentFetcher()
-        assert fetcher.fetch("") == ""
+    @pytest.mark.parametrize("url", ["", "ftp://example.com", "http://127.0.0.1/admin", "http://169.254.169.254/", "http://localhost:8080/", "http://10.0.0.1/"])
+    def test_fetch_rejects_ssrf_urls(self, url):
+        assert DefaultWebContentFetcher().fetch(url) == ""
 
-    def test_fetch_non_http_url(self):
-        fetcher = DefaultWebContentFetcher()
-        assert fetcher.fetch("ftp://example.com") == ""
+    @pytest.mark.parametrize("status", [403, 404, 429, 500, 502, 503, 504, 521])
+    def test_http_error_status(self, status):
+        with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(status))) as client:
+            with pytest.raises(FetchError) as exc:
+                DefaultWebContentFetcher(client=client).fetch("https://example.com")
+        assert exc.value.status.value == f"http_{status}"
 
-    def test_fetch_rejects_ssrf_urls(self):
-        fetcher = DefaultWebContentFetcher()
-        assert fetcher.fetch("http://127.0.0.1/admin") == ""
-        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
-        assert fetcher.fetch("http://localhost:8080/") == ""
-        assert fetcher.fetch("http://10.0.0.1/internal") == ""
-
-    def test_fetch_http_521_raises_fetch_error(self):
-        fetcher = DefaultWebContentFetcher()
-        http_response = MagicMock()
-        http_response.status_code = 521
-        err = httpx.HTTPStatusError("521", request=MagicMock(), response=http_response)
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value.raise_for_status.side_effect = err
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://csdn.net/article")
-        assert exc_info.value.status == FetchStatus.HTTP_521
-
-    def test_fetch_http_403_raises_fetch_error(self):
-        fetcher = DefaultWebContentFetcher()
-        http_response = MagicMock()
-        http_response.status_code = 403
-        err = httpx.HTTPStatusError("403", request=MagicMock(), response=http_response)
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value.raise_for_status.side_effect = err
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://example.com")
-        assert exc_info.value.status == FetchStatus.HTTP_403
-
-    def test_fetch_timeout_raises_fetch_error(self):
-        fetcher = DefaultWebContentFetcher()
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.side_effect = httpx.TimeoutException("timeout")
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://example.com")
-        assert exc_info.value.status == FetchStatus.TIMEOUT
-
-    def test_fetch_network_error_raises_connection_error(self):
-        fetcher = DefaultWebContentFetcher()
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.side_effect = httpx.NetworkError("network error")
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://example.com")
-        assert exc_info.value.status == FetchStatus.CONNECTION_ERROR
+    @pytest.mark.parametrize("error, status", [(httpx.ReadTimeout("timeout"), FetchStatus.TIMEOUT), (httpx.ConnectError("failed"), FetchStatus.CONNECTION_ERROR)])
+    def test_network_errors(self, error, status):
+        def handler(request):
+            raise error
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(FetchError) as exc:
+                DefaultWebContentFetcher(client=client).fetch("https://example.com")
+        assert exc.value.status == status
 
 
 class TestFirecrawlFetcher:
-    def test_fetch_posts_markdown_request_and_truncates_result(self):
-        response = MagicMock()
-        response.json.return_value = {
-            "success": True,
-            "data": {"markdown": "# Firecrawl result"},
-        }
-        with patch("httpx.Client") as mock_client:
-            client = mock_client.return_value.__enter__.return_value
-            client.post.return_value = response
-            fetcher = FirecrawlFetcher("http://localhost:3002", "test-key")
-            result = fetcher.fetch("https://example.com/page", max_length=8)
-
+    def test_fetch_posts_markdown_request_and_truncates_result(self, monkeypatch):
+        import json
+        monkeypatch.setattr("web_fetchers.resolve_public_addresses", lambda *a: ["93.184.216.34"])
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"success": True, "data": {"markdown": "# Firecrawl result"}})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = FirecrawlFetcher("http://localhost:3002", client=client, network_isolated=True).fetch("https://example.com/page", max_length=8)
         assert result == "# Firecr"
-        mock_client.assert_called_once()
-        assert mock_client.call_args.kwargs["timeout"] == 30.0
-        client.post.assert_called_once_with(
-            "http://localhost:3002/v2/scrape",
-            json={
-                "url": "https://example.com/page",
-                "formats": ["markdown"],
-                "onlyMainContent": True,
-            },
-        )
-        assert client.post.call_args.kwargs == {
-            "json": {
-                "url": "https://example.com/page",
-                "formats": ["markdown"],
-                "onlyMainContent": True,
-            },
-        }
-        assert mock_client.call_args.kwargs["headers"]["Authorization"] == "Bearer test-key"
+        assert str(requests[0].url) == "http://localhost:3002/v2/scrape"
+        assert json.loads(requests[0].content) == {"url": "https://example.com/page", "formats": ["markdown"], "onlyMainContent": True}
 
-    def test_fetch_accepts_v2_base_url_and_requires_markdown(self):
-        response = MagicMock()
-        response.json.return_value = {"success": True, "data": {"html": "<p>x</p>"}}
-        with patch("httpx.Client") as mock_client:
-            client = mock_client.return_value.__enter__.return_value
-            client.post.return_value = response
-            fetcher = FirecrawlFetcher("http://localhost:3002/v2")
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("https://example.com")
-        assert client.post.call_args.args[0] == "http://localhost:3002/v2/scrape"
-        assert exc_info.value.status == FetchStatus.PARSE_ERROR
-
-    def test_fetch_raises_on_api_error_response(self):
-        response = MagicMock()
-        response.json.return_value = {"success": False, "error": "page failed"}
-        with patch("httpx.Client") as mock_client:
-            client = mock_client.return_value.__enter__.return_value
-            client.post.return_value = response
-            with pytest.raises(FetchError) as exc_info:
-                FirecrawlFetcher().fetch("https://example.com")
-        assert exc_info.value.status == FetchStatus.PARSE_ERROR
+    @pytest.mark.parametrize("payload", [{"success": False, "error": "failed"}, {"success": True, "data": {"html": "x"}}])
+    def test_invalid_payload(self, payload, monkeypatch):
+        monkeypatch.setattr("web_fetchers.resolve_public_addresses", lambda *a: ["93.184.216.34"])
+        with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))) as client:
+            with pytest.raises(FetchError) as exc:
+                FirecrawlFetcher(client=client, network_isolated=True).fetch("https://example.com")
+        assert exc.value.status == FetchStatus.PARSE_ERROR
 
     def test_rejects_invalid_api_url(self):
         with pytest.raises(ValueError, match="absolute HTTP or HTTPS URL"):
             FirecrawlFetcher("localhost:3002")
 
-    def test_fetch_rejects_ssrf_urls(self):
-        fetcher = FirecrawlFetcher()
-        assert fetcher.fetch("http://127.0.0.1/admin") == ""
-        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
-        assert fetcher.fetch("http://localhost:8080/") == ""
-
-
-# ---------------------------------------------------------------------------
-# JinaReaderFetcher
-# ---------------------------------------------------------------------------
 
 class TestJinaReaderFetcher:
-    def _fetcher(self):
+    def test_fetch_success(self, monkeypatch):
         from fallback_fetcher import JinaReaderFetcher
-        return JinaReaderFetcher(api_url="https://r.jina.ai/")
+        monkeypatch.setattr("web_fetchers.resolve_public_addresses", lambda *a: ["93.184.216.34"])
+        with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"content": "# Hello from Jina"}))) as client:
+            fetcher = JinaReaderFetcher(client=client, network_isolated=True)
+            assert fetcher.fetch("https://example.com", max_length=7) == "# Hello"
 
-    def test_fetch_success(self):
-        fetcher = self._fetcher()
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {"content": "# Hello from Jina"}
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value = resp
-            result = fetcher.fetch("http://example.com")
-        assert "Hello from Jina" in result
-
-    def test_fetch_truncates_to_max_length(self):
-        fetcher = self._fetcher()
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {"content": "x" * 10000}
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value = resp
-            result = fetcher.fetch("http://example.com", max_length=100)
-        assert len(result) == 100
-
-    def test_fetch_empty_url(self):
-        fetcher = self._fetcher()
-        assert fetcher.fetch("") == ""
-
-    def test_fetch_rejects_ssrf_urls(self):
-        fetcher = self._fetcher()
-        assert fetcher.fetch("http://127.0.0.1/admin") == ""
-        assert fetcher.fetch("http://169.254.169.254/latest/meta-data/") == ""
-        assert fetcher.fetch("http://localhost:8080/") == ""
-
-    def test_fetch_http_403_raises_fetch_error(self):
-        fetcher = self._fetcher()
-        http_response = MagicMock()
-        http_response.status_code = 403
-        err = httpx.HTTPStatusError("403", request=MagicMock(), response=http_response)
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.return_value.raise_for_status.side_effect = err
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://example.com")
-        assert exc_info.value.status == FetchStatus.HTTP_403
-
-    def test_fetch_timeout_raises_fetch_error(self):
-        fetcher = self._fetcher()
-        with patch("httpx.Client") as MockClient:
-            instance = MockClient.return_value.__enter__.return_value
-            instance.get.side_effect = httpx.TimeoutException("timeout")
-            with pytest.raises(FetchError) as exc_info:
-                fetcher.fetch("http://example.com")
-        assert exc_info.value.status == FetchStatus.TIMEOUT
-
-
-# ---------------------------------------------------------------------------
-# populate_content
-# ---------------------------------------------------------------------------
 
 class TestPopulateContent:
     def test_primary_success(self):

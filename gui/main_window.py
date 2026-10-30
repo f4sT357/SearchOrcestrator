@@ -57,6 +57,14 @@ from gui.worker import (
 from search_orchestrator import (
     SearchResult, Settings, normalize_official_domains,
 )
+from security import is_safe_url
+
+
+class ReportBrowser(QTextBrowser):
+    """Reports may render text, but cannot load local or remote resources."""
+
+    def loadResource(self, resource_type, name):
+        return None
 
 
 class MainWindow(QMainWindow):
@@ -449,8 +457,10 @@ class MainWindow(QMainWindow):
         summary_layout = QVBoxLayout(summary_tab)
         summary_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.summary_browser = QTextBrowser(self)
-        self.summary_browser.setOpenExternalLinks(True)
+        self.summary_browser = ReportBrowser(self)
+        self.summary_browser.setOpenExternalLinks(False)
+        self.summary_browser.setOpenLinks(False)
+        self.summary_browser.anchorClicked.connect(self._open_source_url)
         self.summary_browser.setPlaceholderText("調査が完了すると、ここにレポートが表示されます。")
         summary_layout.addWidget(self.summary_browser)
 
@@ -669,6 +679,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "設定エラー", "LM Studioのモデルを更新または入力してください。")
             return
 
+        if (self.fetch_content_cb.isChecked()
+                and (self.fetcher_combo.currentData() == "firecrawl" or self.jina_fallback_cb.isChecked())
+                and not self.default_settings.remote_fetchers_network_isolated):
+            QMessageBox.warning(self, "設定エラー", "Firecrawl/Jinaはサービス側の外向き通信制限が必要です。標準取得を選択してください。隔離済みの環境では設定ファイルのremote_fetchers_network_isolatedを有効にできます。")
+            return
         self._save_config()
 
         max_concurrency = self.concurrency_spin.value()
@@ -817,7 +832,17 @@ class MainWindow(QMainWindow):
     def _on_source_cell_clicked(self, row: int, column: int) -> None:
         url_item = self.sources_table.item(row, 5)
         if url_item and url_item.text():
-            QDesktopServices.openUrl(QUrl(url_item.text()))
+            self._open_source_url(QUrl(url_item.text()))
+
+    def _open_source_url(self, url: QUrl) -> None:
+        target = url.toString()
+        known_urls = {
+            self.sources_table.item(row, 5).text()
+            for row in range(self.sources_table.rowCount())
+            if self.sources_table.item(row, 5) is not None
+        }
+        if target in known_urls and is_safe_url(target):
+            QDesktopServices.openUrl(url)
 
     def _copy_summary_to_clipboard(self) -> None:
         text = self.summary_browser.toPlainText()

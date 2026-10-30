@@ -21,7 +21,7 @@ class Settings:
     lmstudio_context_length: int = 65536
     lmstudio_auto_load_model: bool = True
     base_url: str = "http://localhost:1234/v1"
-    api_key: str = "lm-studio"
+    api_key: str = field(default="lm-studio", repr=False)
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     max_concurrency: int = 2
     max_search_queries: int = 13
@@ -37,7 +37,8 @@ class Settings:
     fetch_timeout: float = 8.0
     content_fetcher: str = "builtin"
     firecrawl_api_url: str = "http://localhost:3002"
-    firecrawl_api_key: str = ""
+    firecrawl_api_key: str = field(default="", repr=False)
+    remote_fetchers_network_isolated: bool = False
     use_fallback_fetcher: bool = False
     jina_api_url: str = "https://r.jina.ai/"
     official_domains: tuple[str, ...] = ()
@@ -97,7 +98,7 @@ class Settings:
         object.__setattr__(self, "llm_extra_body", dict(self.llm_extra_body))
         if self.web_cache_ttl_seconds < 0:
             raise ValueError("web_cache_ttl_seconds cannot be negative")
-        if self.web_host_min_interval_seconds < 0 or self.web_max_retry_after_seconds < 0:
+        if any(not math.isfinite(value) or value < 0 for value in (self.web_host_min_interval_seconds, self.web_max_retry_after_seconds)):
             raise ValueError("web fetch timing settings cannot be negative")
         if not math.isfinite(self.source_assessment_min_credibility) or not 0 <= self.source_assessment_min_credibility <= 1:
             raise ValueError("source_assessment_min_credibility must be between 0 and 1")
