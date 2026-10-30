@@ -232,7 +232,7 @@ class DefaultWebContentFetcher:
                 if path.stat().st_size > MAX_RESPONSE_BYTES:
                     return None
                 payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError, RecursionError):
                 return None
         if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
             return None

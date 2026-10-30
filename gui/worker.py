@@ -17,6 +17,7 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from lmstudio_client import ensure_lmstudio_model_loaded, fetch_lmstudio_model_keys
+from security import redact_sensitive_text
 from search_orchestrator import Settings, create_workflow, preload_reranker, fetch_available_models
 
 
@@ -172,23 +173,26 @@ class ResearchWorker(QThread):
         self.settings = settings
         self.max_concurrency = max_concurrency
 
+    def _log_message(self, message: str) -> None:
+        self.log_signal.emit(redact_sensitive_text(message, secrets=self.settings.protected_secrets))
+
     def run(self) -> None:
         security_logger = logging.getLogger("search_orchestrator.security")
-        security_handler = _SecurityLogRelay(self.log_signal.emit)
+        security_handler = _SecurityLogRelay(self._log_message)
         security_logger.addHandler(security_handler)
         try:
             fetch_settings = _fetch_settings_summary(self.settings)
-            self.log_signal.emit(
+            self._log_message(
                 f"ワークフローを初期化中... (モデル: {self.settings.model}, {fetch_settings})"
             )
             workflow = create_workflow(
                 self.settings,
-                log=self.log_signal.emit,
+                log=self._log_message,
                 board_update=self.board_signal.emit,
                 progress=self.progress_signal.emit,
             )
 
-            self.log_signal.emit(f"調査を開始します: 「{self.query}」")
+            self._log_message(f"調査を開始します: 「{self.query}」")
             initial_state = {
                 "query": self.query,
                 "understood_request": "",
@@ -205,19 +209,20 @@ class ResearchWorker(QThread):
                 "searched_queries": [],
             }
 
-            self.log_signal.emit("依頼内容を整理し、調査計画の立案とWeb検索を実行中...")
+            self._log_message("依頼内容を整理し、調査計画の立案とWeb検索を実行中...")
             result = workflow.invoke(
                 initial_state,
                 {"max_concurrency": self.max_concurrency},
             )
 
             self.progress_signal.emit("workflow", "completed", "")
-            self.log_signal.emit("調査と回答生成が正常に完了しました。")
+            self._log_message("調査と回答生成が正常に完了しました。")
             self.result_signal.emit(result)
         except Exception as exc:
-            self.progress_signal.emit("workflow", "failed", str(exc))
-            self.log_signal.emit(f"エラーが発生しました: {exc}")
-            self.error_signal.emit(str(exc))
+            message = redact_sensitive_text(str(exc), secrets=self.settings.protected_secrets)
+            self.progress_signal.emit("workflow", "failed", message)
+            self._log_message(f"エラーが発生しました: {message}")
+            self.error_signal.emit(message)
         finally:
             security_logger.removeHandler(security_handler)
             security_handler.close()

@@ -21,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from app_settings import Settings
-from security import SECURITY_INSTRUCTIONS, safe_search_query, security_event, untrusted_data
+from security import SECURITY_INSTRUCTIONS, redact_sensitive_text, safe_search_query, security_event, untrusted_data
 from evaluation_helpers import (
     MAX_EVIDENCE_SOURCES,
     MIN_RELEVANCE_FOR_EVALUATION,
@@ -69,6 +69,10 @@ from source_assessment import (
 
 class EmptyModelResponseError(RuntimeError):
     """Raised when a local reasoning model consumes its budget without an answer."""
+
+
+class InvalidModelResponseError(EmptyModelResponseError, ValueError):
+    """Unsupported model output is rejected before downstream parsing/rendering."""
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +309,8 @@ def populate_content(
 
 
 
-_SOURCE_REF_RE = re.compile(r"\[S(\d+)\]")
-_SOURCE_REF_CANDIDATE_RE = re.compile(r"\[S[^\]\r\n]*\d[^\]\r\n]*\]", re.IGNORECASE)
+_SOURCE_REF_RE = re.compile(r"\[S([1-9][0-9]{0,5})\]")
+_SOURCE_REF_CANDIDATE_RE = re.compile(r"\[S[^\[\]\r\n]*\d[^\[\]\r\n]*\]", re.IGNORECASE)
 _INLINE_URL_RE = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
 
 
@@ -539,14 +543,10 @@ class ResearchWorkflowNodes:
 
     def log_detail(self, message: str) -> None:
         if self.log is not None:
-            for secret in (self.settings.api_key, self.settings.firecrawl_api_key):
-                if secret and len(secret) >= 8:
-                    message = message.replace(secret, "[REDACTED]")
-            message = re.sub(r"(https?://[^\s\"<>?]+)\?[^\s\"<>]*", r"\1?[REDACTED]", message)
-            self.log(message)
+            self.log(redact_sensitive_text(message, secrets=self.settings.protected_secrets))
 
     def _search_text(self, query: str, *, max_results: int, original_query: str = ""):
-        if not safe_search_query(query, original_query, secrets=(self.settings.api_key, self.settings.firecrawl_api_key)):
+        if not safe_search_query(query, original_query, secrets=self.settings.protected_secrets):
             self.log_detail("[SECURITY] 検索語を安全性検査で拒否しました（詳細はセキュリティログ）")
             return []
         return self.search.text(query, max_results=max_results)
@@ -614,7 +614,11 @@ class ResearchWorkflowNodes:
             raise
 
         content = getattr(response, "content", "")
-        content_text = content if isinstance(content, str) else str(content)
+        if not isinstance(content, str) or len(content) > 65536:
+            metric.update({"status": "invalid_output", "duration_ms": round((time.perf_counter() - started_at) * 1000)})
+            self.log_detail(f"[LLM_METRIC] {json.dumps(metric, ensure_ascii=False)}")
+            raise InvalidModelResponseError("Model output must be text within the application limit")
+        content_text = content
         response_extra = getattr(response, "additional_kwargs", {})
         reasoning_content = (
             response_extra.get("reasoning_content", "")

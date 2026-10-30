@@ -55,7 +55,7 @@ class SourceAssessmentCache:
             if payload.get("content_fingerprint") != fingerprint:
                 return None
             return SourceAssessment.model_validate(payload["assessment"])
-        except (OSError, TypeError, ValueError, KeyError):
+        except (OSError, TypeError, ValueError, KeyError, AttributeError, RecursionError):
             return None
 
     def put(self, assessment: SourceAssessment, content: str | None) -> None:

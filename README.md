@@ -27,6 +27,8 @@
 
 2026-10-30のセキュリティ修正内容・検証範囲・制約は [セキュリティレビュー](SECURITY_REVIEW_JA.md) を参照してください。標準HTTP取得を既定とし、Firecrawl／Jinaはサービス側の通信制限を別途構成した環境に限り利用できます。
 
+使い捨てDocker環境での攻撃者・模擬LLM試験と再実行手順は [レッドチーム試験記録](security_reports/REDTEAM_JA.md) を参照してください。
+
 Python 3.11 から 3.13 を用意してから、次を実行します。
 
 ```powershell

@@ -62,6 +62,11 @@ class Settings:
     source_assessment_cache_dir: str = ".cache/source-assessments"
     source_assessment_min_credibility: float = DEFAULT_MIN_CREDIBILITY_FOR_EVIDENCE
 
+    @property
+    def protected_secrets(self) -> tuple[str, ...]:
+        # LM Studio's documented placeholder is not an authentication secret.
+        return (self.api_key if self.api_key != "lm-studio" else "", self.firecrawl_api_key)
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "official_domains", normalize_official_domains(self.official_domains))
         object.__setattr__(self, "trusted_domains", normalize_official_domains(self.trusted_domains))
